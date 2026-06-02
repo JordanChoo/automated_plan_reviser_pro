@@ -102,6 +102,19 @@ END APR DOCUMENT MANIFEST"
     [[ "$output" == *"- implementation: IMPLEMENTATION.md [skipped; missing_optional]"* ]]
 }
 
+@test "manifest_collect_documents: preserves empty fields for unconfigured implementation" {
+    printf 'hello\n' > README.md
+    printf 'spec\n' > SPECIFICATION.md
+
+    local entries
+    entries=$(manifest_collect_documents README.md SPECIFICATION.md "" false)
+
+    run manifest_render_text "$entries"
+
+    assert_success
+    [[ "$output" == *"- implementation: (not configured) [skipped; not_requested]"* ]]
+}
+
 @test "manifest_render_json: emits stable machine-readable entries" {
     if ! command -v jq >/dev/null 2>&1; then
         skip "jq not available"

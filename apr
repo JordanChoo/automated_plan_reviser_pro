@@ -1609,8 +1609,10 @@ manifest_file_size_bytes() {
 
 manifest_sanitize_field() {
     local value="${1:-}"
+    local sep=$'\037'
     value=${value//$'\t'/ }
     value=${value//$'\n'/ }
+    value=${value//$sep/ }
     printf '%s' "$value"
 }
 
@@ -1735,7 +1737,7 @@ manifest_build_entry() {
         sha256_hash=""
     fi
 
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    printf '%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\n' \
         "$sort_key" \
         "$(manifest_sanitize_field "$role")" \
         "$(manifest_sanitize_field "$status")" \
@@ -1768,11 +1770,11 @@ manifest_collect_documents() {
 
 manifest_render_text() {
     local manifest_entries="$1"
-    local tab=$'\t'
+    local sep=$'\037'
 
     printf '%s\n' "APR DOCUMENT MANIFEST"
-    printf '%s\n' "$manifest_entries" | LC_ALL=C sort -t "$tab" -k1,1 | \
-        while IFS=$'\t' read -r sort_key role status inclusion_reason display_path base_name size_bytes sha256_hash; do
+    printf '%s\n' "$manifest_entries" | LC_ALL=C sort -t "$sep" -k1,1 | \
+        while IFS=$'\037' read -r sort_key role status inclusion_reason display_path base_name size_bytes sha256_hash; do
             [[ -n "$sort_key$role$status$inclusion_reason$display_path$base_name$size_bytes$sha256_hash" ]] || continue
             if [[ "$status" == "included" ]]; then
                 printf -- '- %s: %s [included; %s; %s; sha256=%s]\n' \
@@ -1787,20 +1789,16 @@ manifest_render_text() {
 
 manifest_render_json() {
     local manifest_entries="$1"
-    local tab=$'\t'
+    local sep=$'\037'
 
     command -v jq &>/dev/null || return 1
 
-    printf '%s\n' "$manifest_entries" | LC_ALL=C sort -t "$tab" -k1,1 | \
-        while IFS=$'\t' read -r sort_key role status inclusion_reason display_path base_name size_bytes sha256_hash; do
+    printf '%s\n' "$manifest_entries" | LC_ALL=C sort -t "$sep" -k1,1 | \
+        while IFS=$'\037' read -r sort_key role status inclusion_reason display_path base_name size_bytes sha256_hash; do
             [[ -n "$sort_key$role$status$inclusion_reason$display_path$base_name$size_bytes$sha256_hash" ]] || continue
             local bytes_json="null"
-            local sha_json="null"
             if [[ -n "$size_bytes" ]]; then
                 bytes_json="$size_bytes"
-            fi
-            if [[ -n "$sha256_hash" ]]; then
-                sha_json=$(jq -nc --arg sha "$sha256_hash" '$sha')
             fi
             jq -nc \
                 --arg role "$role" \
@@ -1808,8 +1806,8 @@ manifest_render_json() {
                 --arg inclusion_reason "$inclusion_reason" \
                 --arg path "$display_path" \
                 --arg basename "$base_name" \
+                --arg sha256 "$sha256_hash" \
                 --argjson bytes "$bytes_json" \
-                --argjson sha256 "$sha_json" \
                 '{
                     role: $role,
                     path: $path,
@@ -1817,7 +1815,7 @@ manifest_render_json() {
                     status: $status,
                     inclusion_reason: $inclusion_reason,
                     bytes: $bytes,
-                    sha256: $sha256
+                    sha256: (if $sha256 == "" then null else $sha256 end)
                 }'
         done | jq -sc .
 }
