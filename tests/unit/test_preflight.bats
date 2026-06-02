@@ -111,6 +111,24 @@ create_path_without_oracle() {
     echo "$mock_bin"
 }
 
+create_oracle_npm_install() {
+    local prefix="$1"
+    local package_dir="$prefix/lib/node_modules/@steipete/oracle"
+    local action_dir="$package_dir/dist/src/browser/actions"
+
+    mkdir -p "$prefix/bin" "$package_dir/bin" "$action_dir"
+
+    cat > "$package_dir/bin/oracle" <<'EOF'
+#!/usr/bin/env bash
+echo "oracle 0.8.4"
+EOF
+    chmod +x "$package_dir/bin/oracle"
+    ln -s "../lib/node_modules/@steipete/oracle/bin/oracle" "$prefix/bin/oracle"
+
+    printf '%s\n' "current assistant response" > "$action_dir/assistantResponse.js"
+    printf '%s\n' "$action_dir/assistantResponse.js"
+}
+
 assert_json_array_contains() {
     local json="$1"
     local path="$2"
@@ -242,6 +260,97 @@ assert_json_array_contains() {
     log_test_actual "exit code" "$CAPTURED_STATUS"
     [[ "$CAPTURED_STATUS" -eq 2 ]]
     [[ "$CAPTURED_STDERR" == *"Could not verify Oracle version"* ]]
+}
+
+@test "find_oracle_assistant_response: ignores unrelated npm root fallback" {
+    local mock_bin="$TEST_DIR/mock_bin"
+    local unrelated_node_modules="$TEST_DIR/unrelated/lib/node_modules"
+    local unrelated_action_dir="$unrelated_node_modules/@steipete/oracle/dist/src/browser/actions"
+    mkdir -p "$mock_bin" "$unrelated_action_dir"
+
+    cat > "$mock_bin/oracle" <<'EOF'
+#!/usr/bin/env bash
+echo "wrapper oracle"
+EOF
+    chmod +x "$mock_bin/oracle"
+
+    cat > "$mock_bin/npm" <<EOF
+#!/usr/bin/env bash
+if [[ "\${1:-}" == "root" && "\${2:-}" == "-g" ]]; then
+    echo "$unrelated_node_modules"
+    exit 0
+fi
+exit 1
+EOF
+    chmod +x "$mock_bin/npm"
+    printf '%s\n' "unrelated oracle package" > "$unrelated_action_dir/assistantResponse.js"
+
+    local original_path="$PATH"
+    PATH="$mock_bin:$PATH"
+    export PATH
+
+    run find_oracle_assistant_response
+
+    PATH="$original_path"
+    export PATH
+
+    [[ "$status" -eq 1 ]]
+}
+
+@test "find_oracle_assistant_response: finds package adjacent to selected oracle symlink" {
+    local prefix="$TEST_DIR/npm_prefix"
+    local target_file
+    target_file="$(create_oracle_npm_install "$prefix")"
+
+    local original_path="$PATH"
+    PATH="$prefix/bin:$PATH"
+    export PATH
+
+    capture_streams find_oracle_assistant_response
+
+    PATH="$original_path"
+    export PATH
+
+    [[ "$CAPTURED_STATUS" -eq 0 ]]
+    [[ "$ORACLE_ASSISTANT_RESPONSE_PATH" == "$target_file" ]]
+    [[ "$ORACLE_BACKUP_PATH" == "${target_file}.apr-backup" ]]
+}
+
+@test "restore_oracle_from_backup: fails cleanly when backup is missing" {
+    local prefix="$TEST_DIR/npm_prefix"
+    create_oracle_npm_install "$prefix" >/dev/null
+
+    local original_path="$PATH"
+    PATH="$prefix/bin:$PATH"
+    export PATH
+
+    capture_streams restore_oracle_from_backup
+
+    PATH="$original_path"
+    export PATH
+
+    [[ "$CAPTURED_STATUS" -eq 1 ]]
+    [[ "$CAPTURED_STDERR" == *"No Oracle backup found"* ]]
+}
+
+@test "restore_oracle_from_backup: restores assistantResponse.js from backup" {
+    local prefix="$TEST_DIR/npm_prefix"
+    local target_file
+    target_file="$(create_oracle_npm_install "$prefix")"
+    printf '%s\n' "original assistant response" > "${target_file}.apr-backup"
+    printf '%s\n' "patched assistant response" > "$target_file"
+
+    local original_path="$PATH"
+    PATH="$prefix/bin:$PATH"
+    export PATH
+
+    capture_streams restore_oracle_from_backup
+
+    PATH="$original_path"
+    export PATH
+
+    [[ "$CAPTURED_STATUS" -eq 0 ]]
+    [[ "$(cat "$target_file")" == "original assistant response" ]]
 }
 
 # =============================================================================

@@ -323,6 +323,7 @@ capture_streams() {
 setup_mock_oracle() {
     local mock_oracle="$TEST_DIR/bin/oracle"
     mkdir -p "$(dirname "$mock_oracle")"
+    export APR_NO_ORACLE_PATCH=1
 
     cat > "$mock_oracle" << 'EOF'
 #!/usr/bin/env bash

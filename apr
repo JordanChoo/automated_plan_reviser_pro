@@ -27,6 +27,7 @@
 #   dashboard          Interactive analytics dashboard (TUI)
 #   backfill           Generate metrics from existing rounds
 #   update             Check for and install updates
+#   restore-oracle     Restore Oracle stability patch backup
 #   help               Show help message
 #
 # Options:
@@ -692,54 +693,57 @@ oracle_detect_features() {
 #   stableCycles: APR_ORACLE_STABLE_CYCLES (normal), 18 (short)
 #
 # NOTE: If Oracle is updated via npm, the backup may become stale.
-# Run `apr --restore-oracle` or delete the .apr-backup file to re-patch.
+# Run `apr restore-oracle` or delete the .apr-backup file to re-patch.
 
 ORACLE_ASSISTANT_RESPONSE_PATH=""
 ORACLE_BACKUP_PATH=""
 
 find_oracle_assistant_response() {
     # Find Oracle's assistantResponse.js in the npm installation
-    local oracle_path=""
+    local oracle_path="" resolved_path="" node_modules=""
+    local candidate_node_modules=()
 
     # Try to find oracle binary location
     if command -v oracle &>/dev/null; then
         oracle_path=$(command -v oracle)
-        # Resolve symlinks to find actual installation
-        if [[ -L "$oracle_path" ]]; then
-            oracle_path=$(readlink -f "$oracle_path" 2>/dev/null || realpath "$oracle_path" 2>/dev/null)
-        fi
     fi
 
-    # Find the node_modules root
-    local node_modules=""
-    if [[ -n "$oracle_path" ]]; then
-        # Navigate from bin/oracle to lib/node_modules/@steipete/oracle
-        local bin_dir
-        bin_dir=$(dirname "$oracle_path")
-        local prefix_dir
-        prefix_dir=$(dirname "$bin_dir")
-        node_modules="$prefix_dir/lib/node_modules"
-    fi
-
-    # Fallback: try npm root -g
-    if [[ -z "$node_modules" ]] || [[ ! -d "$node_modules" ]]; then
-        node_modules=$(npm root -g 2>/dev/null || echo "")
-    fi
-
-    if [[ -z "$node_modules" ]] || [[ ! -d "$node_modules" ]]; then
-        verbose "find_oracle_assistant_response: Cannot find npm global node_modules"
+    if [[ -z "$oracle_path" ]]; then
+        verbose "find_oracle_assistant_response: oracle binary not found"
         return 1
     fi
 
-    local target_file="$node_modules/@steipete/oracle/dist/src/browser/actions/assistantResponse.js"
-    if [[ -f "$target_file" ]]; then
-        ORACLE_ASSISTANT_RESPONSE_PATH="$target_file"
-        ORACLE_BACKUP_PATH="${target_file}.apr-backup"
-        verbose "find_oracle_assistant_response: Found at $target_file"
-        return 0
+    resolved_path="$oracle_path"
+    if [[ -L "$oracle_path" ]]; then
+        resolved_path=$(readlink -f "$oracle_path" 2>/dev/null || realpath "$oracle_path" 2>/dev/null || echo "$oracle_path")
     fi
 
-    verbose "find_oracle_assistant_response: assistantResponse.js not found at $target_file"
+    # Candidate 1: npm-style prefix from the executable selected by PATH.
+    local bin_dir prefix_dir
+    bin_dir=$(dirname "$oracle_path")
+    prefix_dir=$(dirname "$bin_dir")
+    candidate_node_modules+=("$prefix_dir/lib/node_modules")
+
+    # Candidate 2: npm package root from the symlink target itself. This handles
+    # common npm bin links such as bin/oracle -> ../lib/node_modules/... without
+    # guessing an unrelated global npm root.
+    if [[ "$resolved_path" == */node_modules/@steipete/oracle/* ]]; then
+        candidate_node_modules+=("${resolved_path%%/node_modules/@steipete/oracle/*}/node_modules")
+    fi
+
+    local target_file
+    for node_modules in "${candidate_node_modules[@]}"; do
+        [[ -d "$node_modules" ]] || continue
+        target_file="$node_modules/@steipete/oracle/dist/src/browser/actions/assistantResponse.js"
+        if [[ -f "$target_file" ]]; then
+            ORACLE_ASSISTANT_RESPONSE_PATH="$target_file"
+            ORACLE_BACKUP_PATH="${target_file}.apr-backup"
+            verbose "find_oracle_assistant_response: Found at $target_file"
+            return 0
+        fi
+    done
+
+    verbose "find_oracle_assistant_response: assistantResponse.js not found for selected oracle binary: $oracle_path"
     return 1
 }
 
@@ -753,6 +757,14 @@ patch_oracle_stability_thresholds() {
     # Skip if user disabled patching
     if [[ "${APR_NO_ORACLE_PATCH:-}" == "1" ]]; then
         verbose "patch_oracle_stability_thresholds: Disabled via APR_NO_ORACLE_PATCH"
+        return 0
+    fi
+
+    # Only a globally installed npm Oracle package has a stable JS file we can
+    # patch. The npx path is ephemeral, and wrappers/mocks must not trigger a
+    # best-guess mutation of an unrelated global package.
+    if [[ "${ORACLE_CMD[0]:-}" != "oracle" ]]; then
+        verbose "patch_oracle_stability_thresholds: Skipping patch for non-global Oracle command: ${ORACLE_CMD[*]:-<unset>}"
         return 0
     fi
 
@@ -843,10 +855,39 @@ restore_oracle_from_backup() {
         return 1
     fi
 
-    cp "$ORACLE_BACKUP_PATH" "$ORACLE_ASSISTANT_RESPONSE_PATH"
+    if [[ ! -w "$ORACLE_ASSISTANT_RESPONSE_PATH" ]]; then
+        print_error "Cannot write to Oracle assistantResponse.js: $ORACLE_ASSISTANT_RESPONSE_PATH"
+        print_info "Fix file permissions or run the command with appropriate privileges"
+        return 1
+    fi
+
+    if ! cp "$ORACLE_BACKUP_PATH" "$ORACLE_ASSISTANT_RESPONSE_PATH"; then
+        print_error "Failed to restore Oracle backup"
+        print_info "Backup remains at: $ORACLE_BACKUP_PATH"
+        return 1
+    fi
+
     APR_ORACLE_PATCHED=false
     print_success "Restored Oracle from backup"
     return 0
+}
+
+cmd_restore_oracle() {
+    print_banner
+    print_header "RESTORE ORACLE PATCH BACKUP"
+    echo "" >&2
+
+    if ! command -v oracle &>/dev/null; then
+        print_error "Oracle binary not found on PATH"
+        print_info "Install Oracle or adjust PATH so APR can locate the patched installation"
+        exit $EXIT_DEPENDENCY_ERROR
+    fi
+
+    if restore_oracle_from_backup; then
+        exit $EXIT_SUCCESS
+    fi
+
+    exit $EXIT_CONFIG_ERROR
 }
 
 # -----------------------------------------------------------------------------
@@ -6629,6 +6670,7 @@ show_help() {
         echo "    $(gum style --foreground 82 'show <round>')       View round output" >&2
         echo "    $(gum style --foreground 82 'backfill')           Generate metrics from existing rounds" >&2
         echo "    $(gum style --foreground 82 'update')             Check for and install updates" >&2
+        echo "    $(gum style --foreground 82 'restore-oracle')     Restore Oracle stability patch backup" >&2
         echo "    $(gum style --foreground 82 'help')               Show this help message" >&2
         echo "" >&2
         gum style --foreground 39 "  Analysis" >&2
@@ -6736,6 +6778,7 @@ show_help() {
         echo -e "    ${GREEN}show <round>${NC}       View round output" >&2
         echo -e "    ${GREEN}backfill${NC}           Generate metrics from existing rounds" >&2
         echo -e "    ${GREEN}update${NC}             Check for and install updates" >&2
+        echo -e "    ${GREEN}restore-oracle${NC}     Restore Oracle stability patch backup" >&2
         echo -e "    ${GREEN}help${NC}               Show this help message" >&2
         echo "" >&2
         echo -e "  ${CYAN}Analysis${NC}" >&2
@@ -6839,8 +6882,9 @@ main() {
     # Check Oracle availability (not needed for some commands)
     local command="${1:-help}"
 
-    # First-run experience: if no args and not configured, show welcome
-    if [[ "$command" == "help" && ! -d "$CONFIG_DIR" ]]; then
+    # First-run experience: if no args and not configured, show welcome.
+    # Explicit `apr help` must still render the full help reference.
+    if [[ $# -eq 0 && ! -d "$CONFIG_DIR" ]]; then
         show_first_run_welcome
         exit $EXIT_SUCCESS
     fi
@@ -7169,6 +7213,9 @@ main() {
             ;;
         update)
             cmd_update
+            ;;
+        restore-oracle)
+            cmd_restore_oracle
             ;;
         help|--help|-h)
             show_help

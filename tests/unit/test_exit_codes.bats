@@ -21,6 +21,9 @@ load '../helpers/test_helper.bash'
 @test "apr help returns EXIT_SUCCESS (0)" {
     run "$APR_SCRIPT" help
     assert_exit_code 0
+    [[ "$output" == *"COMMANDS"* ]]
+    [[ "$output" == *"restore-oracle"* ]]
+    [[ "$output" != *"WELCOME TO APR"* ]]
 }
 
 @test "apr robot help returns EXIT_SUCCESS (0)" {

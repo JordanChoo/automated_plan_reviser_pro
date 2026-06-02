@@ -106,6 +106,7 @@ apr list                       # List workflows
 apr history                    # Round history
 apr backfill                   # Generate metrics from existing rounds
 apr update                     # Self-update
+apr restore-oracle             # Restore Oracle stability patch backup
 
 ## Robot Mode (JSON API)
 
@@ -407,6 +408,7 @@ apr [command] [options]
 | `history` | Show revision history for current workflow |
 | `backfill` | Generate metrics from existing rounds |
 | `update` | Check for and install updates |
+| `restore-oracle` | Restore Oracle stability patch backup |
 | `help` | Show help message |
 | **Analysis** | |
 | `show <round>` | View round output with pager support |
@@ -913,7 +915,7 @@ APR automatically patches Oracle's stability detection thresholds at runtime to 
 | `settleWindowMs` | 5s | 30s | Completion detection window |
 | `stableCycles` | 6 | 12 | Polling cycles required |
 
-The patch is applied during pre-flight checks and persists until Oracle is updated. A backup of the original file is preserved for restoration.
+The patch is applied during pre-flight checks for a global `oracle` install and persists until Oracle is updated. APR skips this patch for `npx` and wrapper-based Oracle commands because those paths are ephemeral or ambiguous. A backup of the original file is preserved; run `apr restore-oracle` to restore it.
 
 **Automatic recovery:** If truncation is detected despite patching (output ends mid-word), APR waits 30 seconds and attempts to reattach to the Oracle session to capture the complete response.
 
@@ -1695,6 +1697,7 @@ These control how APR patches Oracle to tolerate GPT Pro Extended Thinking pause
 | `APR_ORACLE_SHORT_STABLE_MS` | Shorter threshold for non-extended responses | `15000` |
 | `APR_ORACLE_SETTLE_WINDOW_MS` | Completion detection window | `30000` |
 | `APR_ORACLE_STABLE_CYCLES` | Polling cycles required for stability | `12` |
+| `APR_NO_ORACLE_PATCH` | Disable Oracle stability patching | unset |
 
 ### Status & Monitoring
 
