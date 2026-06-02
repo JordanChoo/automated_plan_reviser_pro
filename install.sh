@@ -121,8 +121,8 @@ verify_checksum() {
     elif command -v shasum &> /dev/null; then
         actual=$(shasum -a 256 "$file" | cut -d' ' -f1)
     else
-        log_warn "No sha256sum or shasum available, skipping verification"
-        return 0
+        log_error "Cannot verify checksum: sha256sum or shasum not available"
+        return 1
     fi
 
     if [[ "$actual" == "$expected" ]]; then

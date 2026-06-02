@@ -1,4 +1,5 @@
 #!/usr/bin/env bats
+# shellcheck disable=SC2030,SC2031  # BATS runs each test in an isolated shell.
 # test_manifest.bats - Unit tests for prompt manifest helpers
 
 load '../helpers/test_helper'
@@ -43,6 +44,22 @@ teardown() {
     run manifest_file_sha256 binary.dat
     assert_success
     assert_output --regexp '^[0-9a-f]{64}$'
+}
+
+@test "manifest_file_sha256: fails when no checksum tool is available" {
+    printf 'hello\n' > hello.txt
+    local original_path="$PATH"
+    local bin_dir="$TEST_DIR/no_hash_bin"
+    mkdir -p "$bin_dir"
+    PATH="$bin_dir"
+    export PATH
+
+    run manifest_file_sha256 hello.txt
+
+    PATH="$original_path"
+    export PATH
+
+    assert_failure
 }
 
 @test "manifest_normalize_path: strips project-root absolute paths" {

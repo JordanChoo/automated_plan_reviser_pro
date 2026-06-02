@@ -350,6 +350,40 @@ EOF
     [[ "$ORACLE_BACKUP_PATH" == "${target_file}.apr-backup" ]]
 }
 
+@test "patch_oracle_stability_thresholds: applies patch to npm oracle file" {
+    local prefix="$TEST_DIR/npm_prefix"
+    local target_file
+    target_file="$(create_oracle_npm_install "$prefix")"
+
+    cat > "$target_file" <<'EOF'
+const minStableMs = shortAnswer ? 8000 : 1200;
+const requiredStableCycles = shortAnswer ? 12 : 6;
+const settleWindowMs = shortAnswer ? 12_000 : 5_000;
+const stableTarget = shortAnswer ? 6 : 3;
+EOF
+
+    local original_path="$PATH"
+    PATH="$prefix/bin:$PATH"
+    # shellcheck disable=SC2034  # Consumed by patch_oracle_stability_thresholds.
+    ORACLE_CMD=("oracle")
+    # shellcheck disable=SC2034  # Consumed by patch_oracle_stability_thresholds.
+    APR_ORACLE_PATCHED=false
+    unset APR_NO_ORACLE_PATCH 2>/dev/null || true
+    export PATH
+
+    capture_streams patch_oracle_stability_thresholds
+
+    PATH="$original_path"
+    export PATH
+
+    [[ "$CAPTURED_STATUS" -eq 0 ]]
+    [[ -f "${target_file}.apr-backup" ]]
+    grep -q "APR_PATCHED_STABILITY_THRESHOLDS" "$target_file"
+    grep -q "const requiredStableCycles = shortAnswer ? 18 : 12;" "$target_file"
+    grep -q "const settleWindowMs = shortAnswer ? 15_000 : 30000;" "$target_file"
+    grep -q "const stableTarget = shortAnswer ? 12 : 6;" "$target_file"
+}
+
 @test "restore_oracle_from_backup: fails cleanly when backup is missing" {
     local prefix="$TEST_DIR/npm_prefix"
     create_oracle_npm_install "$prefix" >/dev/null

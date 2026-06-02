@@ -423,6 +423,20 @@ check_for_updates() {
     fi
 }
 
+file_sha256() {
+    local file_path="$1"
+
+    [[ -f "$file_path" && -r "$file_path" ]] || return 1
+
+    if command -v sha256sum &>/dev/null; then
+        sha256sum -- "$file_path" | awk '{print $1}'
+    elif command -v shasum &>/dev/null; then
+        shasum -a 256 -- "$file_path" | awk '{print $1}'
+    else
+        return 1
+    fi
+}
+
 # -----------------------------------------------------------------------------
 # Self-Update Command
 # -----------------------------------------------------------------------------
@@ -525,7 +539,8 @@ cmd_update() {
         exit $EXIT_UPDATE_ERROR
     fi
 
-    # Try to verify checksum (non-fatal if checksums not available)
+    # Verify checksum when a valid checksum artifact is available. A missing
+    # checksum artifact is non-fatal; a present checksum must verify.
     # Checksum file may be: just hash, or "hash  filename" (sha256sum format)
     local expected_checksum="" raw_checksum=""
     if command -v curl &> /dev/null; then
@@ -542,13 +557,13 @@ cmd_update() {
     if [[ -n "$expected_checksum" ]]; then
         print_info "Verifying checksum..."
         local actual_checksum=""
-        if command -v sha256sum &> /dev/null; then
-            actual_checksum=$(sha256sum "$tmp_dir/apr" | cut -d' ' -f1)
-        elif command -v shasum &> /dev/null; then
-            actual_checksum=$(shasum -a 256 "$tmp_dir/apr" | cut -d' ' -f1)
+        if ! actual_checksum=$(file_sha256 "$tmp_dir/apr"); then
+            print_error "Checksum verification failed: sha256sum or shasum not available"
+            rm -rf -- "$tmp_dir"
+            exit $EXIT_UPDATE_ERROR
         fi
 
-        if [[ -n "$actual_checksum" && "$actual_checksum" != "$expected_checksum" ]]; then
+        if [[ "$actual_checksum" != "$expected_checksum" ]]; then
             print_error "Checksum verification failed!"
             print_error "Expected: $expected_checksum"
             print_error "Got:      $actual_checksum"
@@ -756,6 +771,17 @@ find_oracle_assistant_response() {
     return 1
 }
 
+sed_in_place() {
+    local expression="$1"
+    local file_path="$2"
+
+    if sed --version >/dev/null 2>&1; then
+        sed -i "$expression" "$file_path"
+    else
+        sed -i '' "$expression" "$file_path"
+    fi
+}
+
 patch_oracle_stability_thresholds() {
     # Skip if already patched this session
     if [[ "$APR_ORACLE_PATCHED" == "true" ]]; then
@@ -812,28 +838,28 @@ patch_oracle_stability_thresholds() {
         verbose "patch_oracle_stability_thresholds: Backup created at $ORACLE_BACKUP_PATH"
     fi
 
-    # Apply patches using sed -i (in-place, more robust than echo piping)
+    # Apply patches using a GNU/BSD-compatible in-place sed wrapper.
     # Note: Using | as delimiter to avoid escaping issues with /
 
     # Patch 1: minStableMs in pollAssistantCompletion (line ~293)
     # Original: const minStableMs = shortAnswer ? 8000 : 1200;
     # Patched:  const minStableMs = shortAnswer ? 15000 : 30000; /* APR_PATCHED_STABILITY_THRESHOLDS */
-    sed -i "s|const minStableMs = shortAnswer ? 8000 : 1200;|const minStableMs = shortAnswer ? ${APR_ORACLE_SHORT_STABLE_MS} : ${APR_ORACLE_MIN_STABLE_MS}; /* APR_PATCHED_STABILITY_THRESHOLDS */|g" "$ORACLE_ASSISTANT_RESPONSE_PATH"
+    sed_in_place "s|const minStableMs = shortAnswer ? 8000 : 1200;|const minStableMs = shortAnswer ? ${APR_ORACLE_SHORT_STABLE_MS} : ${APR_ORACLE_MIN_STABLE_MS}; /* APR_PATCHED_STABILITY_THRESHOLDS */|g" "$ORACLE_ASSISTANT_RESPONSE_PATH" || return 1
 
     # Patch 2: requiredStableCycles in pollAssistantCompletion (line ~291)
     # Original: const requiredStableCycles = shortAnswer ? 12 : 6;
     # Patched:  const requiredStableCycles = shortAnswer ? 18 : 12;
-    sed -i "s|const requiredStableCycles = shortAnswer ? 12 : 6;|const requiredStableCycles = shortAnswer ? 18 : ${APR_ORACLE_STABLE_CYCLES};|g" "$ORACLE_ASSISTANT_RESPONSE_PATH"
+    sed_in_place "s|const requiredStableCycles = shortAnswer ? 12 : 6;|const requiredStableCycles = shortAnswer ? 18 : ${APR_ORACLE_STABLE_CYCLES};|g" "$ORACLE_ASSISTANT_RESPONSE_PATH" || return 1
 
     # Patch 3: settleWindowMs in waitForSettle (line ~551)
     # Original: const settleWindowMs = shortAnswer ? 12_000 : 5_000;
     # Patched:  const settleWindowMs = shortAnswer ? 15_000 : 30_000;
-    sed -i "s|const settleWindowMs = shortAnswer ? 12_000 : 5_000;|const settleWindowMs = shortAnswer ? 15_000 : ${APR_ORACLE_SETTLE_WINDOW_MS};|g" "$ORACLE_ASSISTANT_RESPONSE_PATH"
+    sed_in_place "s|const settleWindowMs = shortAnswer ? 12_000 : 5_000;|const settleWindowMs = shortAnswer ? 15_000 : ${APR_ORACLE_SETTLE_WINDOW_MS};|g" "$ORACLE_ASSISTANT_RESPONSE_PATH" || return 1
 
     # Patch 4: stableTarget in waitForSettle (line ~557)
     # Original: const stableTarget = shortAnswer ? 6 : 3;
     # Patched:  const stableTarget = shortAnswer ? 12 : 6;
-    sed -i "s|const stableTarget = shortAnswer ? 6 : 3;|const stableTarget = shortAnswer ? 12 : 6;|g" "$ORACLE_ASSISTANT_RESPONSE_PATH"
+    sed_in_place "s|const stableTarget = shortAnswer ? 6 : 3;|const stableTarget = shortAnswer ? 12 : 6;|g" "$ORACLE_ASSISTANT_RESPONSE_PATH" || return 1
 
     # Verify patch was applied
     if grep -q "APR_PATCHED_STABILITY_THRESHOLDS" "$ORACLE_ASSISTANT_RESPONSE_PATH" 2>/dev/null; then
@@ -1639,15 +1665,7 @@ load_prompt_template() {
 manifest_file_sha256() {
     local file_path="$1"
 
-    [[ -f "$file_path" && -r "$file_path" ]] || return 1
-
-    if command -v sha256sum &>/dev/null; then
-        sha256sum -- "$file_path" | awk '{print $1}'
-    elif command -v shasum &>/dev/null; then
-        shasum -a 256 -- "$file_path" | awk '{print $1}'
-    else
-        return 1
-    fi
+    file_sha256 "$file_path"
 }
 
 manifest_file_size_bytes() {
