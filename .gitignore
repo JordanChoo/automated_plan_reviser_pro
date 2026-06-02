@@ -29,3 +29,6 @@ checksums.txt
 
 # Test artifacts (ephemeral logs)
 tests/logs/
+
+# br doctor per-run artifacts
+.doctor/

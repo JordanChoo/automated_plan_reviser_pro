@@ -43,3 +43,7 @@ beads.right.meta.json
 
 # bv (beads viewer) lock file
 .bv.lock
+
+# br transient write artifacts
+.write.lock
+*.tmp
