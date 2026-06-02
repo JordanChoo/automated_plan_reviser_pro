@@ -457,19 +457,25 @@ teardown() {
 # apr status / attach Tests
 # =============================================================================
 
-@test "apr status: calls oracle status with hours" {
-    setup_mock_oracle
+@test "apr status: lists and refreshes API sessions with hours" {
+    setup_mock_api
+    mkdir -p .apr/api_sessions .apr/logs .apr/rounds/default
+    local ts
+    ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    cat > .apr/api_sessions/apr-default-round-1.json <<EOF
+{"slug":"apr-default-round-1","response_id":"resp_mock_apr_default_round_1","status":"in_progress","workflow":"default","round":1,"include_impl":false,"model":"gpt-5.5","output_file":".apr/rounds/default/round_1.md","log_file":".apr/logs/api_apr-default-round-1.json","created_at":"$ts","updated_at":"$ts","completed_at":null}
+EOF
 
     capture_streams "$APR_SCRIPT" status --hours 12
 
     log_test_actual "stderr" "$CAPTURED_STDERR"
 
-    [[ "$CAPTURED_STDERR" == *"Mock Oracle called with: status --hours 12"* ]]
+    [[ "$CAPTURED_STDERR" == *"API SESSION STATUS"* ]]
+    [[ "$CAPTURED_STDERR" == *"apr-default-round-1"* ]]
+    [[ "$CAPTURED_STDERR" == *"completed"* ]]
 }
 
 @test "apr status: rejects non-numeric hours" {
-    setup_mock_oracle
-
     capture_streams "$APR_SCRIPT" status --hours foo
 
     log_test_actual "exit code" "$CAPTURED_STATUS"
@@ -479,14 +485,21 @@ teardown() {
     [[ "$CAPTURED_STDERR" == *"requires a non-negative integer"* ]]
 }
 
-@test "apr attach: calls oracle session with --render" {
-    setup_mock_oracle
+@test "apr attach: refreshes API session and prints completed output" {
+    setup_mock_api
+    mkdir -p .apr/api_sessions .apr/logs .apr/rounds/default
+    cat > .apr/api_sessions/apr-test-session.json <<'EOF'
+{"slug":"apr-test-session","response_id":"resp_mock_apr_test_session","status":"in_progress","workflow":"default","round":1,"include_impl":false,"model":"gpt-5.5","output_file":".apr/rounds/default/round_1.md","log_file":".apr/logs/api_apr-test-session.json","created_at":"2026-06-02T00:00:00Z","updated_at":"2026-06-02T00:00:00Z","completed_at":null}
+EOF
 
     capture_streams "$APR_SCRIPT" attach apr-test-session
 
+    log_test_actual "stdout" "$CAPTURED_STDOUT"
     log_test_actual "stderr" "$CAPTURED_STDERR"
 
-    [[ "$CAPTURED_STDERR" == *"Mock Oracle called with: session apr-test-session --render"* ]]
+    [[ "$CAPTURED_STATUS" -eq 0 ]]
+    [[ "$CAPTURED_STDOUT" == *"Mock API review output"* ]]
+    [[ "$CAPTURED_STDERR" == *"Status: completed"* ]]
 }
 
 # =============================================================================
@@ -501,7 +514,7 @@ teardown() {
     log_test_output "$output"
 
     assert_success
-    [[ "$output" == *"Now integrate the following feedback"* ]]
+    [[ "$output" == *"Now integrate the following API review feedback"* ]]
     [[ "$output" == *"Round 1"* ]]
 }
 

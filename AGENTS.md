@@ -37,7 +37,7 @@ If that audit trail is missing, then you must act as if the operation never happ
 
 ## Project Overview
 
-**APR (Automated Plan Reviser Pro)** is a CLI tool that automates iterative specification refinement using GPT Pro Extended Reasoning via Oracle browser automation.
+**APR (Automated Plan Reviser Pro)** is a CLI tool that automates iterative specification refinement using OpenAI Responses API background jobs.
 
 ### Core Concept
 
@@ -49,8 +49,8 @@ Like numerical optimization converging on a steady state, specification design i
 
 APR automates the tedious parts:
 - Bundling documents (README, spec, implementation)
-- Sending to GPT Pro 5.2 with Extended Reasoning
-- Session management and monitoring
+- Creating stored Responses API jobs with reasoning settings
+- API session management and monitoring
 - Round tracking and history
 
 ---
@@ -72,7 +72,7 @@ This is a **pure Bash project** (no embedded languages).
 - **Stream separation** — stderr for human-readable output (progress, errors), stdout for structured data.
 - **XDG compliance** — Data in `~/.local/share/apr/`, cache in `~/.cache/apr/`.
 - **No global `cd`** — Use absolute paths; change directory only when necessary.
-- **Graceful degradation** — gum → ANSI colors, Oracle global → npx.
+- **Graceful degradation** — gum → ANSI colors; API status can use cached session records when credentials are unavailable.
 
 ---
 
@@ -103,9 +103,10 @@ When APR is used in a project, it creates:
     ├── config.yaml           # Default workflow setting
     ├── workflows/            # Workflow definitions
     │   └── <name>.yaml
-    ├── rounds/               # GPT Pro outputs
+    ├── rounds/               # API review outputs
     │   └── <workflow>/
     │       └── round_N.md
+    ├── api_sessions/         # Stored Responses API session records
     └── templates/            # Custom prompt templates
 ```
 
@@ -124,8 +125,9 @@ documents:
   spec: SPECIFICATION.md
   implementation: docs/implementation.md  # Optional
 
-oracle:
-  model: "5.2 Thinking"
+api:
+  model: "gpt-5.5"
+  reasoning_effort: high
 
 rounds:
   output_dir: .apr/rounds/example
@@ -184,9 +186,8 @@ Visual design:
 | Package | Version | Purpose |
 |---------|---------|---------|
 | Bash | 4.0+ | Script runtime |
-| Oracle | latest | GPT Pro browser automation |
-| Node.js | 18+ | Oracle runtime |
-| curl/wget | any | HTTP requests |
+| curl | any | Responses API requests |
+| jq | any | JSON request/response handling |
 
 ### Optional
 
@@ -196,32 +197,21 @@ Visual design:
 
 ---
 
-## Oracle Integration
+## Direct API Integration
 
-APR uses [Oracle](https://github.com/steipete/oracle) for GPT Pro browser automation.
+APR uses the OpenAI Responses API directly. It builds one deterministic review bundle from the README/spec/implementation documents, sends it to `POST /v1/responses` with `background: true` and `store: true`, then records the response id under `.apr/api_sessions/<slug>.json`.
 
-Key Oracle features used:
-- `--engine browser` — Browser automation for ChatGPT webapp
-- `-m "5.2 Thinking"` — Model selection with extended reasoning
-- `--browser-attachments never` — **Paste inline instead of file uploads** (more reliable)
-- `--slug` — Human-readable session identifier
-- `--write-output` — Save response to file
-- `--notify` — Desktop notification on completion (if supported)
-- `--heartbeat` — Progress updates
-
-**Critical: Inline Pasting vs File Uploads**
-
-APR always uses `--browser-attachments never` to paste document contents directly into the chat. This is far more reliable than file uploads because:
-- File uploads can fail silently or trigger "duplicate file" errors
-- File uploads can trigger "you've already uploaded this file" rejections
-- Inline pasting works consistently for documents up to ~200KB
+Key API features used:
+- `model` — Workflow-configured model id such as `gpt-5.5`
+- `reasoning.effort` — Workflow or environment-controlled reasoning depth
+- `background: true` — Long reviews continue after the CLI returns
+- `store: true` — Responses can be retrieved later by id
+- `metadata.apr_slug` — Stable APR round/session identity
 
 Session management:
-- `oracle status` — List recent sessions
-- `oracle session <slug>` — Attach to session
-- `oracle session <slug> --render` — View with output
-
-For headless/SSH environments, see README.md section on Oracle Remote Setup.
+- `apr status` — Lists cached API sessions and refreshes active ones when `OPENAI_API_KEY` is available
+- `apr attach <slug-or-response-id>` — Retrieves status/output from the cached session or direct response id
+- `.apr/logs/api_<slug>.json` — Cached raw API response JSON
 
 ---
 
@@ -298,11 +288,11 @@ When modifying APR:
 
 1. [ ] `apr --help` displays correctly
 2. [ ] `apr setup` wizard works (interactive)
-3. [ ] `apr run 1 --dry-run` shows correct command
-4. [ ] `apr status` shows Oracle sessions
+3. [ ] `apr run 1 --dry-run` shows the Responses API request preview
+4. [ ] `apr status` shows API sessions
 5. [ ] `apr list` shows workflows
 6. [ ] gum fallback works when gum unavailable
-7. [ ] Oracle npx fallback works when not globally installed
+7. [ ] `apr attach <slug>` refreshes and displays completed API output
 
 ---
 
@@ -334,9 +324,9 @@ When modifying APR:
 ## Security Considerations
 
 - APR does not store credentials
-- Oracle uses browser cookies for ChatGPT auth
+- `OPENAI_API_KEY` is read from the environment and never written to disk
 - Session data stored locally in `.apr/`
-- No data sent to external services except ChatGPT via Oracle
+- Review bundles are sent to the configured `OPENAI_BASE_URL`
 
 ---
 
@@ -531,7 +521,7 @@ rg -l -t sh 'eval' | xargs ast-grep run -l Bash -p 'eval $$$'
 
 | Scenario | Tool | Why |
 |----------|------|-----|
-| "How does the Oracle integration work?" | `warp_grep` | Exploratory; don't know where to start |
+| "How does the API integration work?" | `warp_grep` | Exploratory; don't know where to start |
 | "Where is session tracking handled?" | `warp_grep` | Need to understand architecture |
 | "Find all uses of `gum`" | `ripgrep` | Targeted literal search |
 | "Replace all `echo` with `printf`" | `ast-grep` | Structural refactor |
@@ -562,7 +552,7 @@ mcp__morph-mcp__warp_grep(
 
 ```bash
 cass health
-cass search "Oracle session management" --robot --limit 5
+cass search "Responses API session management" --robot --limit 5
 cass view /path/to/session.jsonl -n 42 --json
 cass expand /path/to/session.jsonl -n 42 -C 3 --json
 cass capabilities --json

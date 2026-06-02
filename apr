@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 #
 # apr - Automated Plan Reviser Pro (v1.2.0)
-# Iterative specification refinement with GPT Pro Extended Reasoning via Oracle
+# Iterative specification refinement with OpenAI Responses API reasoning models
 #
 # FEATURES:
 #   - Beautiful gum-based terminal UI with graceful ANSI fallback
 #   - Interactive workflow setup wizard
 #   - Multi-round revision tracking with git integration
-#   - GPT Pro 5.2 Extended Reasoning via Oracle browser automation
+#   - OpenAI Responses API background execution
 #   - Session monitoring and reattachment
 #   - Configurable document bundles (README, spec, implementation)
 #   - Automatic round output management and history tracking
@@ -20,28 +20,23 @@
 # Commands:
 #   run <round>        Run a revision round (default command)
 #   setup              Interactive workflow setup wizard
-#   status             Check Oracle session status
+#   status             Check API session status
 #   attach <session>   Attach to a running/completed session
 #   list               List all configured workflows
 #   history            Show revision history for current workflow
 #   dashboard          Interactive analytics dashboard (TUI)
 #   backfill           Generate metrics from existing rounds
 #   update             Check for and install updates
-#   restore-oracle     Restore Oracle stability patch backup
 #   help               Show help message
 #
 # Options:
 #   -w, --workflow     Workflow name (default: from .apr/config.yaml or 'default')
 #   -i, --include-impl Include implementation document
-#   -d, --dry-run      Preview without sending to GPT Pro
+#   -d, --dry-run      Preview without creating an API job
 #   -r, --render       Render bundle for manual paste
 #   -c, --copy         Copy rendered bundle to clipboard
 #   --wait             Wait for completion (blocking)
-#   --login            Manual login mode (first-time setup)
-#   --keep-browser     Keep browser open after completion
 #   --no-preflight     Skip pre-flight checks (not recommended)
-#   --retry            Enable Oracle retries (default)
-#   --no-retry         Disable Oracle retries
 #   -q, --quiet        Minimal output (errors only)
 #   -v, --verbose      Verbose logging (debug)
 #   --version          Show version
@@ -53,12 +48,13 @@
 #   APR_NO_GUM         Disable gum even if available
 #   NO_COLOR           Disable colors (accessibility)
 #
-#   Oracle Stability Thresholds (prevent truncation with GPT Pro Extended Thinking):
-#   APR_ORACLE_MIN_STABLE_MS     Min stability time for normal answers (default: 30000ms)
-#   APR_ORACLE_SHORT_STABLE_MS   Min stability time for short answers (default: 15000ms)
-#   APR_ORACLE_SETTLE_WINDOW_MS  Settle window for completion detection (default: 30000ms)
-#   APR_ORACLE_STABLE_CYCLES     Required stable polling cycles (default: 12)
-#   APR_NO_ORACLE_PATCH          Disable Oracle patching (set to 1)
+#   Direct API:
+#   OPENAI_API_KEY              Required for API-backed runs
+#   OPENAI_BASE_URL             OpenAI-compatible API base (default: https://api.openai.com/v1)
+#   APR_DEFAULT_MODEL           Default API model for new workflows (default: gpt-5.5)
+#   APR_REASONING_EFFORT        Override Responses API reasoning effort
+#   APR_TEXT_VERBOSITY          Responses API text verbosity (default: medium)
+#   APR_MAX_OUTPUT_TOKENS       Max response output tokens (default: 32768)
 #
 # More info: https://github.com/Dicklesworthstone/automated_plan_reviser_pro
 
@@ -83,7 +79,7 @@ readonly EXIT_SUCCESS=0
 # shellcheck disable=SC2034  # Reserved for future use
 readonly EXIT_PARTIAL_FAILURE=1   # Some operations failed
 readonly EXIT_USAGE_ERROR=2       # Bad arguments
-readonly EXIT_DEPENDENCY_ERROR=3  # Missing Oracle, Node.js, etc.
+readonly EXIT_DEPENDENCY_ERROR=3  # Missing API key, curl, jq, etc.
 readonly EXIT_CONFIG_ERROR=4      # Invalid config, missing files
 readonly EXIT_NETWORK_ERROR=10    # Timeout, DNS, unreachable
 readonly EXIT_UPDATE_ERROR=11     # Self-update failed
@@ -149,32 +145,26 @@ APR_HOME="${APR_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/apr}"
 APR_CACHE="${APR_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/apr}"
 CONFIG_DIR=".apr"
 
-# Oracle command (determined at runtime)
-ORACLE_CMD=()
+# Direct OpenAI-compatible Responses API configuration
+OPENAI_BASE_URL="${OPENAI_BASE_URL:-https://api.openai.com/v1}"
+APR_DEFAULT_MODEL="${APR_DEFAULT_MODEL:-gpt-5.5}"
+APR_REASONING_EFFORT="${APR_REASONING_EFFORT:-}"
+APR_TEXT_VERBOSITY="${APR_TEXT_VERBOSITY:-medium}"
+APR_MAX_OUTPUT_TOKENS="${APR_MAX_OUTPUT_TOKENS:-32768}"
+APR_API_TIMEOUT="${APR_API_TIMEOUT:-60}"
+APR_API_POLL_INTERVAL="${APR_API_POLL_INTERVAL:-10}"
+APR_API_MAX_POLL_SECONDS="${APR_API_MAX_POLL_SECONDS:-21600}"
 
-# Oracle feature detection (best-effort, set during preflight and other entrypoints)
-ORACLE_SUPPORTS_NOTIFY=false
-ORACLE_FEATURES_DETECTED=false
-
-# Oracle stability thresholds (monkey-patch prevention for GPT Pro Extended Thinking truncation)
-# GPT Pro can pause 10-30+ seconds during thinking, which Oracle misinterprets as completion.
-# These thresholds are patched into Oracle's assistantResponse.js at runtime.
-APR_ORACLE_MIN_STABLE_MS="${APR_ORACLE_MIN_STABLE_MS:-30000}"      # Min stable time for normal answers (default: 30s)
-APR_ORACLE_SHORT_STABLE_MS="${APR_ORACLE_SHORT_STABLE_MS:-15000}"  # Min stable time for short answers (default: 15s)
-APR_ORACLE_SETTLE_WINDOW_MS="${APR_ORACLE_SETTLE_WINDOW_MS:-30000}" # Settle window for normal answers (default: 30s)
-APR_ORACLE_STABLE_CYCLES="${APR_ORACLE_STABLE_CYCLES:-12}"         # Required stable cycles for normal (default: 12)
-APR_ORACLE_PATCHED=false                                           # Track if we've patched Oracle this session
-
-# Validate Oracle threshold env vars are positive integers
-for _apr_var in APR_ORACLE_MIN_STABLE_MS APR_ORACLE_SHORT_STABLE_MS APR_ORACLE_SETTLE_WINDOW_MS APR_ORACLE_STABLE_CYCLES; do
+# Validate API numeric env vars.
+for _apr_var in APR_MAX_OUTPUT_TOKENS APR_API_TIMEOUT APR_API_POLL_INTERVAL APR_API_MAX_POLL_SECONDS; do
     _apr_val="${!_apr_var}"
     if ! [[ "$_apr_val" =~ ^[0-9]+$ ]] || [[ "$_apr_val" -eq 0 ]]; then
         echo "Warning: $_apr_var must be a positive integer, got '$_apr_val'. Using default." >&2
         case "$_apr_var" in
-            APR_ORACLE_MIN_STABLE_MS) APR_ORACLE_MIN_STABLE_MS=30000 ;;
-            APR_ORACLE_SHORT_STABLE_MS) APR_ORACLE_SHORT_STABLE_MS=15000 ;;
-            APR_ORACLE_SETTLE_WINDOW_MS) APR_ORACLE_SETTLE_WINDOW_MS=30000 ;;
-            APR_ORACLE_STABLE_CYCLES) APR_ORACLE_STABLE_CYCLES=12 ;;
+            APR_MAX_OUTPUT_TOKENS) APR_MAX_OUTPUT_TOKENS=32768 ;;
+            APR_API_TIMEOUT) APR_API_TIMEOUT=60 ;;
+            APR_API_POLL_INTERVAL) APR_API_POLL_INTERVAL=10 ;;
+            APR_API_MAX_POLL_SECONDS) APR_API_MAX_POLL_SECONDS=21600 ;;
         esac
     fi
 done
@@ -636,306 +626,411 @@ check_gum() {
 }
 
 # -----------------------------------------------------------------------------
-# Oracle Detection
+# Direct API Backend
 # -----------------------------------------------------------------------------
 
-check_oracle() {
-    if command -v oracle &> /dev/null; then
-        ORACLE_CMD=("oracle")
-        return 0
-    elif [[ -z "${APR_NO_NPX:-}" ]] && command -v npx &> /dev/null; then
-        ORACLE_CMD=("npx" "-y" "@steipete/oracle")
-        return 0
-    else
-        return 1
-    fi
+API_ERROR_MESSAGE=""
+API_RESPONSE_ID=""
+API_RESPONSE_STATUS=""
+
+api_sessions_dir() {
+    printf '%s\n' "$CONFIG_DIR/api_sessions"
 }
 
-oracle_detect_features() {
-    local mode="${1:-full}" # "full" (default) or "fast"
+api_session_path() {
+    local slug="$1"
+    printf '%s/%s.json\n' "$(api_sessions_dir)" "$slug"
+}
 
-    # Only detect once per process unless explicitly reset.
-    [[ "${ORACLE_FEATURES_DETECTED:-false}" == "true" ]] && return 0
+api_response_log_path() {
+    local slug="$1"
+    printf '%s/logs/api_%s.json\n' "$CONFIG_DIR" "$slug"
+}
 
-    ORACLE_SUPPORTS_NOTIFY=false
+api_normalize_model() {
+    local configured="${1:-}"
+    configured=$(yaml_unquote "$configured")
 
-    if [[ ${#ORACLE_CMD[@]} -eq 0 ]]; then
-        return 1
-    fi
-    # Avoid noisy "command not found" output in dry-run placeholder scenarios.
-    if ! command -v "${ORACLE_CMD[0]}" &>/dev/null; then
-        return 1
-    fi
+    case "$configured" in
+        ""|"5.2 Thinking"|"GPT Pro 5.2"|"GPT Pro 5.2 Extended Reasoning")
+            printf '%s\n' "$APR_DEFAULT_MODEL"
+            ;;
+        "5.2 Pro"|"GPT-5.2 Pro"|"gpt-5.2 pro")
+            printf '%s\n' "gpt-5.2-pro"
+            ;;
+        "5.2"|"GPT-5.2")
+            printf '%s\n' "gpt-5.2"
+            ;;
+        "5.5"|"GPT-5.5")
+            printf '%s\n' "gpt-5.5"
+            ;;
+        "5.5 Pro"|"GPT-5.5 Pro"|"gpt-5.5 pro")
+            printf '%s\n' "gpt-5.5-pro"
+            ;;
+        *)
+            printf '%s\n' "$configured"
+            ;;
+    esac
+}
 
-    # In fast mode, avoid triggering `npx -y @steipete/oracle --help` during dry-runs,
-    # which can unexpectedly download/install packages.
-    if [[ "$mode" == "fast" && "${ORACLE_CMD[0]}" == "npx" ]]; then
-        ORACLE_FEATURES_DETECTED=true
-        verbose "oracle_detect_features: skipping --help probe for npx in fast mode"
+api_reasoning_effort() {
+    local thinking_time="${1:-}"
+
+    if [[ -n "${APR_REASONING_EFFORT:-}" ]]; then
+        printf '%s\n' "$APR_REASONING_EFFORT"
         return 0
     fi
 
-    # Check if --notify actually works with real commands (not just appears in help).
-    # Oracle 0.8.4 has a bug where --notify appears in help but is rejected by the parser
-    # when used with actual prompts. Test by checking if the flag produces an error.
-    local _notify_test
-    _notify_test=$("${ORACLE_CMD[@]}" -p "test" --notify --render 2>&1)
-    if echo "$_notify_test" | /usr/bin/grep -q "unknown option"; then
-        ORACLE_SUPPORTS_NOTIFY=false
-        verbose "oracle_detect_features: Oracle --notify rejected by parser (Oracle bug)"
-    else
-        ORACLE_SUPPORTS_NOTIFY=true
-        verbose "oracle_detect_features: Oracle supports --notify"
-    fi
-
-    ORACLE_FEATURES_DETECTED=true
+    case "$thinking_time" in
+        light|low) printf '%s\n' "low" ;;
+        medium|normal) printf '%s\n' "medium" ;;
+        heavy|high) printf '%s\n' "high" ;;
+        xheavy|xhigh|max) printf '%s\n' "xhigh" ;;
+        none) printf '%s\n' "none" ;;
+        "") printf '%s\n' "high" ;;
+        *) printf '%s\n' "high" ;;
+    esac
 }
 
-# -----------------------------------------------------------------------------
-# Oracle Stability Threshold Patching (GPT Pro Extended Thinking Fix)
-# -----------------------------------------------------------------------------
-# Oracle's browser automation detects "completion" when the response text stops
-# changing. However, GPT Pro Extended Thinking can pause for 10-30+ seconds
-# during its reasoning phase, which Oracle misinterprets as completion.
-#
-# This function patches Oracle's assistantResponse.js to use configurable
-# stability thresholds that tolerate GPT Pro's thinking pauses.
-#
-# Original values (cause truncation):
-#   minStableMs: 1200ms (normal), 8000ms (short)
-#   settleWindowMs: 5000ms (normal), 12000ms (short)
-#   stableCycles: 6 (normal), 12 (short)
-#
-# Patched values (configured via APR_ORACLE_* env vars):
-#   minStableMs: APR_ORACLE_MIN_STABLE_MS (normal), APR_ORACLE_SHORT_STABLE_MS (short)
-#   settleWindowMs: APR_ORACLE_SETTLE_WINDOW_MS (normal), 15000ms (short)
-#   stableCycles: APR_ORACLE_STABLE_CYCLES (normal), 18 (short)
-#
-# NOTE: If Oracle is updated via npm, the backup may become stale.
-# Run `apr restore-oracle` or delete the .apr-backup file to re-patch.
+check_api() {
+    if [[ -z "${OPENAI_API_KEY:-}" ]]; then
+        API_ERROR_MESSAGE="OPENAI_API_KEY is not set"
+        return 1
+    fi
+    if ! command -v curl &>/dev/null; then
+        API_ERROR_MESSAGE="curl is required for direct API execution"
+        return 1
+    fi
+    if ! command -v jq &>/dev/null; then
+        API_ERROR_MESSAGE="jq is required for direct API execution"
+        return 1
+    fi
+    API_ERROR_MESSAGE=""
+    return 0
+}
 
-ORACLE_ASSISTANT_RESPONSE_PATH=""
-ORACLE_BACKUP_PATH=""
+api_error_from_file() {
+    local response_file="$1"
+    jq -r '.error.message // .message // empty' "$response_file" 2>/dev/null || true
+}
 
-find_oracle_assistant_response() {
-    # Find Oracle's assistantResponse.js in the npm installation
-    local oracle_path="" resolved_path="" node_modules=""
-    local candidate_node_modules=()
+api_call() {
+    local method="$1"
+    local endpoint="$2"
+    local body="${3:-}"
+    local response_file="$4"
+    local url="${OPENAI_BASE_URL%/}$endpoint"
+    local http_result http_code response_body message
 
-    # Try to find oracle binary location
-    if command -v oracle &>/dev/null; then
-        oracle_path=$(command -v oracle)
+    API_ERROR_MESSAGE=""
+    if [[ -n "$body" ]]; then
+        if ! http_result=$(printf '%s' "$body" | curl -sS \
+            --connect-timeout 10 \
+            --max-time "$APR_API_TIMEOUT" \
+            -X "$method" "$url" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $OPENAI_API_KEY" \
+            --data-binary @- \
+            -w '\n%{http_code}' 2>&1); then
+            API_ERROR_MESSAGE="$http_result"
+            return 1
+        fi
+    else
+        if ! http_result=$(curl -sS \
+            --connect-timeout 10 \
+            --max-time "$APR_API_TIMEOUT" \
+            -X "$method" "$url" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $OPENAI_API_KEY" \
+            -w '\n%{http_code}' 2>&1); then
+            API_ERROR_MESSAGE="$http_result"
+            return 1
+        fi
     fi
 
-    if [[ -z "$oracle_path" ]]; then
-        verbose "find_oracle_assistant_response: oracle binary not found"
+    http_code=$(printf '%s\n' "$http_result" | tail -n 1)
+    response_body=$(printf '%s\n' "$http_result" | sed '$d')
+    printf '%s' "$response_body" > "$response_file"
+
+    if [[ ! "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+        message=$(api_error_from_file "$response_file")
+        API_ERROR_MESSAGE="${message:-API request failed with HTTP $http_code}"
         return 1
     fi
 
-    resolved_path="$oracle_path"
-    if [[ -L "$oracle_path" ]]; then
-        resolved_path=$(readlink -f "$oracle_path" 2>/dev/null || realpath "$oracle_path" 2>/dev/null || echo "$oracle_path")
+    return 0
+}
+
+api_build_response_payload() {
+    local model="$1"
+    local prompt="$2"
+    local reasoning_effort="$3"
+    local background="$4"
+    local slug="$5"
+    local max_output_tokens="${6:-$APR_MAX_OUTPUT_TOKENS}"
+
+    jq -nc \
+        --arg model "$model" \
+        --arg prompt "$prompt" \
+        --arg effort "$reasoning_effort" \
+        --arg verbosity "${APR_TEXT_VERBOSITY:-}" \
+        --arg slug "$slug" \
+        --argjson background "$background" \
+        --argjson max_output_tokens "$max_output_tokens" \
+        '{
+            model: $model,
+            input: [
+                {
+                    role: "user",
+                    content: [
+                        {type: "input_text", text: $prompt}
+                    ]
+                }
+            ],
+            background: $background,
+            store: true,
+            metadata: {apr_slug: $slug}
+        }
+        | if $effort == "" then . else .reasoning = {effort: $effort} end
+        | if $verbosity == "" then . else .text = {verbosity: $verbosity} end
+        | if $max_output_tokens > 0 then .max_output_tokens = $max_output_tokens else . end'
+}
+
+api_response_status() {
+    local response_file="$1"
+    jq -r '.status // "unknown"' "$response_file" 2>/dev/null || printf '%s\n' "unknown"
+}
+
+api_response_id() {
+    local response_file="$1"
+    jq -r '.id // empty' "$response_file" 2>/dev/null || true
+}
+
+api_response_output_text() {
+    local response_file="$1"
+    jq -r '[
+        (.output_text? // empty),
+        (.output[]? | select(.type == "message") | .content[]? | select(.type == "output_text") | .text // empty)
+    ] | map(select(. != "")) | join("\n")' "$response_file" 2>/dev/null || true
+}
+
+api_write_response_output() {
+    local response_file="$1"
+    local output_file="$2"
+    local output_text
+
+    output_text=$(api_response_output_text "$response_file")
+    if [[ -z "$output_text" ]]; then
+        API_ERROR_MESSAGE="API response did not contain output_text"
+        return 1
     fi
 
-    if [[ "$resolved_path" != */node_modules/@steipete/oracle/* ]]; then
-        verbose "find_oracle_assistant_response: selected oracle binary is not the @steipete/oracle npm package: $oracle_path"
-        return 2
+    mkdir -p "$(dirname "$output_file")"
+    printf '%s\n' "$output_text" > "$output_file"
+}
+
+api_write_session_record() {
+    local slug="$1"
+    local response_id="$2"
+    local status="$3"
+    local workflow="$4"
+    local round_num="$5"
+    local include_impl="$6"
+    local model="$7"
+    local output_file="$8"
+    local log_file="$9"
+    local created_at="${10:-}"
+    local completed_at="${11:-}"
+    local record_path now
+
+    now=$(iso_timestamp)
+    [[ -n "$created_at" ]] || created_at="$now"
+    record_path=$(api_session_path "$slug")
+    mkdir -p "$(api_sessions_dir)"
+
+    jq -nc \
+        --arg slug "$slug" \
+        --arg response_id "$response_id" \
+        --arg status "$status" \
+        --arg workflow "$workflow" \
+        --argjson round "$round_num" \
+        --argjson include_impl "$include_impl" \
+        --arg model "$model" \
+        --arg output_file "$output_file" \
+        --arg log_file "$log_file" \
+        --arg created_at "$created_at" \
+        --arg updated_at "$now" \
+        --arg completed_at "$completed_at" \
+        '{
+            slug: $slug,
+            response_id: $response_id,
+            status: $status,
+            workflow: $workflow,
+            round: $round,
+            include_impl: $include_impl,
+            model: $model,
+            output_file: $output_file,
+            log_file: $log_file,
+            created_at: $created_at,
+            updated_at: $updated_at,
+            completed_at: (if $completed_at == "" then null else $completed_at end)
+        }' > "$record_path"
+}
+
+api_update_session_from_response() {
+    local slug="$1"
+    local response_file="$2"
+    local record_path status completed_at tmp
+
+    record_path=$(api_session_path "$slug")
+    [[ -f "$record_path" ]] || return 0
+    status=$(api_response_status "$response_file")
+    completed_at=""
+    case "$status" in
+        completed|failed|cancelled|incomplete) completed_at=$(iso_timestamp) ;;
+    esac
+
+    tmp="${record_path}.tmp.$$"
+    jq \
+        --arg status "$status" \
+        --arg updated_at "$(iso_timestamp)" \
+        --arg completed_at "$completed_at" \
+        '.status = $status
+         | .updated_at = $updated_at
+         | .completed_at = (if $completed_at == "" then .completed_at else $completed_at end)' \
+        "$record_path" > "$tmp"
+    mv "$tmp" "$record_path"
+}
+
+api_create_response_record() {
+    local slug="$1"
+    local workflow="$2"
+    local round_num="$3"
+    local include_impl="$4"
+    local model="$5"
+    local output_file="$6"
+    local prompt="$7"
+    local reasoning_effort="$8"
+    local background="${9:-true}"
+    local log_file payload status response_id
+
+    check_api || return 1
+
+    log_file=$(api_response_log_path "$slug")
+    mkdir -p "$(dirname "$log_file")"
+    payload=$(api_build_response_payload "$model" "$prompt" "$reasoning_effort" "$background" "$slug")
+
+    if ! api_call "POST" "/responses" "$payload" "$log_file"; then
+        return 1
     fi
 
-    # Candidate 1: npm-style prefix from the executable selected by PATH.
-    local bin_dir prefix_dir
-    bin_dir=$(dirname "$oracle_path")
-    prefix_dir=$(dirname "$bin_dir")
-    candidate_node_modules+=("$prefix_dir/lib/node_modules")
-
-    # Candidate 2: npm package root from the symlink target itself. This handles
-    # common npm bin links such as bin/oracle -> ../lib/node_modules/... without
-    # guessing an unrelated global npm root.
-    if [[ "$resolved_path" == */node_modules/@steipete/oracle/* ]]; then
-        candidate_node_modules+=("${resolved_path%%/node_modules/@steipete/oracle/*}/node_modules")
+    response_id=$(api_response_id "$log_file")
+    status=$(api_response_status "$log_file")
+    if [[ -z "$response_id" ]]; then
+        API_ERROR_MESSAGE="API response did not include an id"
+        return 1
     fi
 
-    local target_file
-    for node_modules in "${candidate_node_modules[@]}"; do
-        [[ -d "$node_modules" ]] || continue
-        target_file="$node_modules/@steipete/oracle/dist/src/browser/actions/assistantResponse.js"
-        if [[ -f "$target_file" ]]; then
-            ORACLE_ASSISTANT_RESPONSE_PATH="$target_file"
-            ORACLE_BACKUP_PATH="${target_file}.apr-backup"
-            verbose "find_oracle_assistant_response: Found at $target_file"
+    API_RESPONSE_ID="$response_id"
+    API_RESPONSE_STATUS="$status"
+    api_write_session_record "$slug" "$response_id" "$status" "$workflow" "$round_num" "$include_impl" "$model" "$output_file" "$log_file"
+}
+
+api_terminal_status() {
+    case "$1" in
+        completed|failed|cancelled|incomplete) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+api_poll_response() {
+    local slug="$1"
+    local response_id="$2"
+    local output_file="$3"
+    local log_file="$4"
+    local elapsed=0 status message
+
+    while true; do
+        if ! api_call "GET" "/responses/$response_id" "" "$log_file"; then
+            return 1
+        fi
+
+        status=$(api_response_status "$log_file")
+        api_update_session_from_response "$slug" "$log_file"
+        verbose "api_poll_response: response_id=$response_id status=$status elapsed=${elapsed}s"
+
+        case "$status" in
+            completed)
+                api_write_response_output "$log_file" "$output_file"
+                return $?
+                ;;
+            failed|cancelled|incomplete)
+                message=$(api_error_from_file "$log_file")
+                API_ERROR_MESSAGE="${message:-API response ended with status $status}"
+                return 1
+                ;;
+        esac
+
+        if (( elapsed >= APR_API_MAX_POLL_SECONDS )); then
+            API_ERROR_MESSAGE="Timed out waiting for API response $response_id"
+            return 1
+        fi
+
+        sleep "$APR_API_POLL_INTERVAL"
+        elapsed=$((elapsed + APR_API_POLL_INTERVAL))
+    done
+}
+
+api_find_session_record() {
+    local session="$1"
+    local sessions_dir record
+
+    sessions_dir=$(api_sessions_dir)
+    if [[ -f "$sessions_dir/$session.json" ]]; then
+        printf '%s\n' "$sessions_dir/$session.json"
+        return 0
+    fi
+
+    for record in "$sessions_dir"/*.json; do
+        [[ -f "$record" ]] || continue
+        if jq -e --arg session "$session" '.response_id == $session' "$record" >/dev/null 2>&1; then
+            printf '%s\n' "$record"
             return 0
         fi
     done
 
-    verbose "find_oracle_assistant_response: assistantResponse.js not found for selected oracle binary: $oracle_path"
     return 1
 }
 
-sed_in_place() {
-    local expression="$1"
-    local file_path="$2"
+api_session_busy_for_round() {
+    local workflow="$1"
+    local round_num="$2"
+    local sessions_dir record
 
-    if sed --version >/dev/null 2>&1; then
-        sed -i "$expression" "$file_path"
-    else
-        sed -i '' "$expression" "$file_path"
-    fi
-}
+    sessions_dir=$(api_sessions_dir)
+    [[ -d "$sessions_dir" ]] || return 1
 
-patch_oracle_stability_thresholds() {
-    # Skip if already patched this session
-    if [[ "$APR_ORACLE_PATCHED" == "true" ]]; then
-        verbose "patch_oracle_stability_thresholds: Already patched this session"
-        return 0
-    fi
+    for record in "$sessions_dir"/*.json; do
+        [[ -f "$record" ]] || continue
+        if jq -e \
+            --arg workflow "$workflow" \
+            --argjson round "$round_num" \
+            '(.workflow == $workflow)
+             and (.round == $round)
+             and ((.status // "") as $status | ["queued", "in_progress", "requires_action"] | index($status) != null)' \
+            "$record" >/dev/null 2>&1; then
+            return 0
+        fi
+    done
 
-    # Skip if user disabled patching
-    if [[ "${APR_NO_ORACLE_PATCH:-}" == "1" ]]; then
-        verbose "patch_oracle_stability_thresholds: Disabled via APR_NO_ORACLE_PATCH"
-        return 0
-    fi
-
-    # Only a globally installed npm Oracle package has a stable JS file we can
-    # patch. The npx path is ephemeral, and wrappers/mocks must not trigger a
-    # best-guess mutation of an unrelated global package.
-    if [[ "${ORACLE_CMD[0]:-}" != "oracle" ]]; then
-        verbose "patch_oracle_stability_thresholds: Skipping patch for non-global Oracle command: ${ORACLE_CMD[*]:-<unset>}"
-        return 0
-    fi
-
-    # Find the file to patch. Local wrappers/mocks named "oracle" are valid for
-    # tests and custom deployments, but they are not patchable npm installs.
-    local find_status=0
-    find_oracle_assistant_response || find_status=$?
-    if (( find_status == 2 )); then
-        verbose "patch_oracle_stability_thresholds: Skipping patch for non-npm Oracle command"
-        return 0
-    elif (( find_status != 0 )); then
-        print_warning "Cannot find Oracle assistantResponse.js for stability patching"
-        print_warning "GPT Pro Extended Thinking responses may be truncated"
-        return 1
-    fi
-
-    # Check if file is already patched (look for our marker comment)
-    if grep -q "APR_PATCHED_STABILITY_THRESHOLDS" "$ORACLE_ASSISTANT_RESPONSE_PATH" 2>/dev/null; then
-        verbose "patch_oracle_stability_thresholds: Already patched (marker found)"
-        APR_ORACLE_PATCHED=true
-        return 0
-    fi
-
-    # Check if we can write to the file
-    if [[ ! -w "$ORACLE_ASSISTANT_RESPONSE_PATH" ]]; then
-        print_warning "Cannot write to Oracle assistantResponse.js (permission denied)"
-        print_warning "Run with sudo or fix permissions: $ORACLE_ASSISTANT_RESPONSE_PATH"
-        return 1
-    fi
-
-    verbose "patch_oracle_stability_thresholds: Patching $ORACLE_ASSISTANT_RESPONSE_PATH"
-
-    # Create backup if it doesn't exist
-    if [[ ! -f "$ORACLE_BACKUP_PATH" ]]; then
-        cp "$ORACLE_ASSISTANT_RESPONSE_PATH" "$ORACLE_BACKUP_PATH"
-        verbose "patch_oracle_stability_thresholds: Backup created at $ORACLE_BACKUP_PATH"
-    fi
-
-    # Apply patches using a GNU/BSD-compatible in-place sed wrapper.
-    # Note: Using | as delimiter to avoid escaping issues with /
-
-    # Patch 1: minStableMs in pollAssistantCompletion (line ~293)
-    # Original: const minStableMs = shortAnswer ? 8000 : 1200;
-    # Patched:  const minStableMs = shortAnswer ? 15000 : 30000; /* APR_PATCHED_STABILITY_THRESHOLDS */
-    sed_in_place "s|const minStableMs = shortAnswer ? 8000 : 1200;|const minStableMs = shortAnswer ? ${APR_ORACLE_SHORT_STABLE_MS} : ${APR_ORACLE_MIN_STABLE_MS}; /* APR_PATCHED_STABILITY_THRESHOLDS */|g" "$ORACLE_ASSISTANT_RESPONSE_PATH" || return 1
-
-    # Patch 2: requiredStableCycles in pollAssistantCompletion (line ~291)
-    # Original: const requiredStableCycles = shortAnswer ? 12 : 6;
-    # Patched:  const requiredStableCycles = shortAnswer ? 18 : 12;
-    sed_in_place "s|const requiredStableCycles = shortAnswer ? 12 : 6;|const requiredStableCycles = shortAnswer ? 18 : ${APR_ORACLE_STABLE_CYCLES};|g" "$ORACLE_ASSISTANT_RESPONSE_PATH" || return 1
-
-    # Patch 3: settleWindowMs in waitForSettle (line ~551)
-    # Original: const settleWindowMs = shortAnswer ? 12_000 : 5_000;
-    # Patched:  const settleWindowMs = shortAnswer ? 15_000 : 30_000;
-    sed_in_place "s|const settleWindowMs = shortAnswer ? 12_000 : 5_000;|const settleWindowMs = shortAnswer ? 15_000 : ${APR_ORACLE_SETTLE_WINDOW_MS};|g" "$ORACLE_ASSISTANT_RESPONSE_PATH" || return 1
-
-    # Patch 4: stableTarget in waitForSettle (line ~557)
-    # Original: const stableTarget = shortAnswer ? 6 : 3;
-    # Patched:  const stableTarget = shortAnswer ? 12 : 6;
-    sed_in_place "s|const stableTarget = shortAnswer ? 6 : 3;|const stableTarget = shortAnswer ? 12 : 6;|g" "$ORACLE_ASSISTANT_RESPONSE_PATH" || return 1
-
-    # Verify patch was applied
-    if grep -q "APR_PATCHED_STABILITY_THRESHOLDS" "$ORACLE_ASSISTANT_RESPONSE_PATH" 2>/dev/null; then
-        APR_ORACLE_PATCHED=true
-        print_success "Patched Oracle stability thresholds for GPT Pro Extended Thinking"
-        verbose "patch_oracle_stability_thresholds: Patch applied successfully"
-        verbose "  minStableMs: ${APR_ORACLE_MIN_STABLE_MS}ms (normal), ${APR_ORACLE_SHORT_STABLE_MS}ms (short)"
-        verbose "  settleWindowMs: ${APR_ORACLE_SETTLE_WINDOW_MS}ms"
-        verbose "  stableCycles: ${APR_ORACLE_STABLE_CYCLES}"
-        return 0
-    else
-        print_warning "Oracle patch may not have applied correctly"
-        return 1
-    fi
-}
-
-restore_oracle_from_backup() {
-    # Restore Oracle's original assistantResponse.js from backup
-    if [[ -z "$ORACLE_BACKUP_PATH" ]] || [[ -z "$ORACLE_ASSISTANT_RESPONSE_PATH" ]]; then
-        find_oracle_assistant_response || return 1
-    fi
-
-    if [[ ! -f "$ORACLE_BACKUP_PATH" ]]; then
-        print_error "No Oracle backup found at $ORACLE_BACKUP_PATH"
-        return 1
-    fi
-
-    # Verify destination directory exists (Oracle might have been uninstalled)
-    local dest_dir
-    dest_dir=$(dirname "$ORACLE_ASSISTANT_RESPONSE_PATH")
-    if [[ ! -d "$dest_dir" ]]; then
-        print_error "Oracle installation directory not found: $dest_dir"
-        print_error "Oracle may have been uninstalled. Backup preserved at: $ORACLE_BACKUP_PATH"
-        return 1
-    fi
-
-    if [[ ! -w "$ORACLE_ASSISTANT_RESPONSE_PATH" ]]; then
-        print_error "Cannot write to Oracle assistantResponse.js: $ORACLE_ASSISTANT_RESPONSE_PATH"
-        print_info "Fix file permissions or run the command with appropriate privileges"
-        return 1
-    fi
-
-    if ! cp "$ORACLE_BACKUP_PATH" "$ORACLE_ASSISTANT_RESPONSE_PATH"; then
-        print_error "Failed to restore Oracle backup"
-        print_info "Backup remains at: $ORACLE_BACKUP_PATH"
-        return 1
-    fi
-
-    APR_ORACLE_PATCHED=false
-    print_success "Restored Oracle from backup"
-    return 0
-}
-
-cmd_restore_oracle() {
-    print_banner
-    print_header "RESTORE ORACLE PATCH BACKUP"
-    echo "" >&2
-
-    if ! command -v oracle &>/dev/null; then
-        print_error "Oracle binary not found on PATH"
-        print_info "Install Oracle or adjust PATH so APR can locate the patched installation"
-        exit $EXIT_DEPENDENCY_ERROR
-    fi
-
-    if restore_oracle_from_backup; then
-        exit $EXIT_SUCCESS
-    fi
-
-    exit $EXIT_CONFIG_ERROR
+    return 1
 }
 
 # -----------------------------------------------------------------------------
-# Pre-flight Oracle Validation
+# Pre-flight API Validation
 # -----------------------------------------------------------------------------
 
-# Run pre-flight checks before expensive Oracle runs
+# Run pre-flight checks before expensive API runs
 # Usage: preflight_check readme_path spec_path [impl_path]
 # Returns: 0 if all checks pass, 1 if critical failure, 2 if warning only
 preflight_check() {
@@ -948,33 +1043,14 @@ preflight_check() {
 
     print_info "Running pre-flight checks..."
 
-    # Check Oracle availability
-    if ! check_oracle; then
-        print_error "Pre-flight failed: Oracle not available"
+    # Check direct API readiness. Render and dry-run modes do not call this
+    # function, so a real run should fail before spending time assembling output.
+    if ! check_api; then
+        print_error "Pre-flight failed: $API_ERROR_MESSAGE"
         return 1
     fi
-    verbose "preflight: Oracle available via ${ORACLE_CMD[*]}"
-
-    # Try to check Oracle health (quick version check)
-    local oracle_version=""
-    if oracle_version=$("${ORACLE_CMD[@]}" --version 2>/dev/null); then
-        verbose "preflight: Oracle version: $oracle_version"
-        print_success "Oracle available ($oracle_version)"
-    else
-        print_warning "Could not verify Oracle version (may still work)"
-        has_warnings=true
-    fi
-
-    # Detect Oracle feature support (--notify may not exist in older versions)
-    oracle_detect_features || true
-
-    # Patch Oracle stability thresholds to prevent GPT Pro Extended Thinking truncation
-    # This is critical for reliable spec revision - without it, responses are often cut off mid-sentence
-    if ! patch_oracle_stability_thresholds; then
-        print_warning "Oracle stability patch failed - responses may be truncated"
-        print_warning "Set APR_NO_ORACLE_PATCH=1 to disable this warning"
-        has_warnings=true
-    fi
+    verbose "preflight: API base URL: ${OPENAI_BASE_URL%/}"
+    print_success "Direct API ready (${OPENAI_BASE_URL%/})"
 
     # Check source files exist and are readable
     if [[ ! -f "$readme_path" ]]; then
@@ -1063,13 +1139,13 @@ preflight_check() {
 # Prompt Quality Controls
 # -----------------------------------------------------------------------------
 #
-# Browser automation runs are expensive and slow. We fail fast on common
+# API review runs are expensive and slow. We fail fast on common
 # "how did that even happen?" mistakes and produce actionable errors.
 
 PROMPT_QC_REASON=""
 PROMPT_QC_DETAILS=""
 
-# Validate that the prompt we send to Oracle/ChatGPT does not contain obvious
+# Validate that the prompt we send to the API does not contain obvious
 # unexpanded placeholders (e.g. {{README}}). APR does NOT expand mustache-style
 # placeholders; if they appear here, the model will see them verbatim.
 #
@@ -1109,11 +1185,11 @@ prompt_quality_check() {
             cat <<EOF
 Why this fails:
 - The model will literally see "{{README}}" instead of the README contents.
-- APR already attaches the files via Oracle; the prompt should reference them by name.
+- APR already includes the files in the API prompt bundle; templates should reference them by name.
 
 Fix:
 - Remove {{...}} placeholders from your workflow templates.
-- Replace with instructions like: "Read the attached README.md" / "Read the attached spec file".
+- Replace with instructions like: "Read the README section" / "Read the spec section".
 
 Offending lines:
 ${prompt_hits:-  (no prompt hits captured)}
@@ -1133,79 +1209,25 @@ EOF
 }
 
 # -----------------------------------------------------------------------------
-# Auto-Retry with Exponential Backoff
+# API Job Creation Semantics
 # -----------------------------------------------------------------------------
-
-# Maximum retry attempts
-MAX_RETRY_ATTEMPTS="${APR_MAX_RETRIES:-3}"
-# Initial backoff in seconds
-INITIAL_BACKOFF="${APR_INITIAL_BACKOFF:-10}"
-
-# Validate retry configuration to avoid integer-comparison crashes when env vars are invalid.
-# - MAX_RETRY_ATTEMPTS must be >= 1
-# - INITIAL_BACKOFF may be 0 (useful for tests / instant retries)
-if ! is_non_negative_int "$MAX_RETRY_ATTEMPTS" || [[ "$MAX_RETRY_ATTEMPTS" -lt 1 ]]; then
-    MAX_RETRY_ATTEMPTS=3
-fi
-if ! is_non_negative_int "$INITIAL_BACKOFF"; then
-    INITIAL_BACKOFF=10
-fi
-
-# Run Oracle with auto-retry on transient failures
-# Usage: run_oracle_with_retry oracle_args...
-# Returns: Oracle exit code
-run_oracle_with_retry() {
-    local attempt=1
-    local backoff="$INITIAL_BACKOFF"
-    local exit_code=0
-
-    verbose "run_oracle_with_retry: max_attempts=$MAX_RETRY_ATTEMPTS initial_backoff=$INITIAL_BACKOFF"
-
-    while [[ $attempt -le $MAX_RETRY_ATTEMPTS ]]; do
-        verbose "Oracle attempt $attempt/$MAX_RETRY_ATTEMPTS"
-
-        # Run Oracle command
-        set +e
-        "${ORACLE_CMD[@]}" "$@"
-        exit_code=$?
-        set -e
-
-        verbose "Oracle attempt $attempt exit_code=$exit_code"
-
-        # Success - return immediately
-        if [[ $exit_code -eq 0 ]]; then
-            return 0
-        fi
-
-        # Check if this is a retryable error
-        # Exit codes: typically network/transient issues are specific codes
-        # For now, we'll retry on any non-zero exit if we have attempts left
-        if [[ $attempt -lt $MAX_RETRY_ATTEMPTS ]]; then
-            print_warning "Attempt $attempt/$MAX_RETRY_ATTEMPTS failed (exit code: $exit_code)"
-            print_info "Retrying in ${backoff}s..."
-            sleep "$backoff"
-            # Exponential backoff: 10s, 30s, 90s
-            backoff=$((backoff * 3))
-        fi
-
-        ((attempt++))
-    done
-
-    print_error "All $MAX_RETRY_ATTEMPTS attempts failed"
-    return "$exit_code"
-}
+#
+# Responses API jobs are stateful once created. APR intentionally does not
+# blindly retry POST /responses after transport failures because a retry can
+# create duplicate expensive reviews. Polling GET /responses/{id} is safe and
+# can be repeated by `apr status` or `apr attach`.
 
 # -----------------------------------------------------------------------------
 # Output Validation
 # -----------------------------------------------------------------------------
-# Validates Oracle output file for completeness.
+# Validates API output file for completeness.
 # Returns 0 if valid, 1 if truncated/incomplete.
 # Sets OUTPUT_VALIDATION_REASON with explanation.
 
 OUTPUT_VALIDATION_REASON=""
 
 # Minimum expected size for a revision round output (in bytes)
-# GPT Pro Extended Reasoning typically produces 10KB+ for spec reviews
+# Reasoning models typically produce 10KB+ for spec reviews
 readonly MIN_OUTPUT_SIZE_BYTES=2048
 
 validate_output_file() {
@@ -1494,7 +1516,7 @@ show_first_run_welcome() {
     print_header "WELCOME TO APR!"
     echo "" >&2
     echo "  APR automates iterative specification refinement using" >&2
-    echo "  GPT Pro Extended Reasoning via Oracle." >&2
+    echo "  OpenAI Responses API background jobs." >&2
     echo "" >&2
     print_info "To get started, run the setup wizard:"
     echo "" >&2
@@ -1894,7 +1916,7 @@ manifest_render_json() {
         done | jq -sc .
 }
 
-# Build the revision prompt for GPT Pro review
+# Build the revision prompt for API review
 # Usage: build_revision_prompt [include_impl]
 # Returns prompt via stdout
 build_revision_prompt() {
@@ -1911,7 +1933,7 @@ build_revision_prompt() {
     local prompt="First, read this README:
 
 \`\`\`
-<contents of README will be included by oracle>
+<contents of README will be included by APR>
 \`\`\`
 
 ---
@@ -1924,7 +1946,7 @@ the implementation in mind as you think about the specification, since
 ultimately the specification needs to be translated into code eventually!
 
 \`\`\`
-<contents of implementation will be included by oracle>
+<contents of implementation will be included by APR>
 \`\`\`
 
 ---
@@ -1942,11 +1964,59 @@ rationale/justification for why it would make the project better along
 with the git-diff style change versus the original plan shown below:
 
 \`\`\`
-<contents of spec will be included by oracle>
+<contents of spec will be included by APR>
 \`\`\`
 "
 
     printf '%s\n' "$prompt"
+}
+
+render_prompt_bundle() {
+    local readme_path="$1"
+    local spec_path="$2"
+    local impl_path="${3:-}"
+    local include_impl="${4:-false}"
+    local prompt="$5"
+
+    printf '%s\n\n' "APR DIRECT API REVIEW BUNDLE"
+    printf '## README (%s)\n\n' "$readme_path"
+    printf '~~~~markdown\n'
+    cat "$readme_path"
+    printf '\n~~~~\n\n'
+
+    if [[ "$include_impl" == "true" && -n "$impl_path" && -f "$impl_path" ]]; then
+        printf '## IMPLEMENTATION (%s)\n\n' "$impl_path"
+        printf '~~~~markdown\n'
+        cat "$impl_path"
+        printf '\n~~~~\n\n'
+    fi
+
+    printf '## SPECIFICATION (%s)\n\n' "$spec_path"
+    printf '~~~~markdown\n'
+    cat "$spec_path"
+    printf '\n~~~~\n\n'
+
+    printf '## REVIEW INSTRUCTIONS\n\n'
+    printf '%s\n' "$prompt"
+}
+
+copy_text_to_clipboard() {
+    local text="$1"
+    local label="${2:-text}"
+
+    if command -v pbcopy &>/dev/null; then
+        printf '%s' "$text" | pbcopy
+        print_success "$label copied to clipboard (pbcopy)"
+    elif command -v xclip &>/dev/null; then
+        printf '%s' "$text" | xclip -selection clipboard
+        print_success "$label copied to clipboard (xclip)"
+    elif command -v xsel &>/dev/null; then
+        printf '%s' "$text" | xsel --clipboard
+        print_success "$label copied to clipboard (xsel)"
+    else
+        print_warning "No clipboard tool found (pbcopy, xclip, xsel)"
+        return 1
+    fi
 }
 
 # -----------------------------------------------------------------------------
@@ -2850,7 +2920,7 @@ calculate_round_changes() {
 
 # calculate_output_trend_signal - Detect decreasing output size trend
 #
-# GPT Pro's feedback typically decreases in size as specifications mature.
+# Model feedback typically decreases in size as specifications mature.
 # Early rounds produce lengthy analyses; convergence shows as more focused,
 # briefer feedback. Compares average output size of first half vs second half
 # of recent rounds.
@@ -3143,6 +3213,86 @@ update_convergence_metrics() {
     verbose "Convergence metrics updated"
 }
 
+record_completed_round_metrics() {
+    local workflow="$1"
+    local round_num="$2"
+    local readme_path="$3"
+    local spec_path="$4"
+    local impl_path="${5:-}"
+    local output_file="$6"
+    local output_dir="$7"
+
+    if ! command -v jq &>/dev/null; then
+        print_warning "jq not available; skipping metrics collection"
+        return 0
+    fi
+
+    local doc_metrics="" round_record="" change_metrics="" confidence="" is_high=0
+    doc_metrics=$(collect_round_document_metrics "$workflow" "$round_num" \
+        "$readme_path" "$spec_path" "$impl_path" "$output_file") || {
+        print_warning "Metrics collection failed; continuing without analytics"
+        return 0
+    }
+
+    if [[ -z "$doc_metrics" ]]; then
+        print_warning "Metrics collection returned no data"
+        return 0
+    fi
+
+    round_record=$(jq -nc \
+        --argjson num "$round_num" \
+        --arg ts "$(iso_timestamp)" \
+        --argjson docs "$doc_metrics" \
+        '{
+            round: $num,
+            timestamp: $ts,
+            documents: {
+                readme: $docs.readme,
+                spec: $docs.spec,
+                implementation: $docs.implementation
+            },
+            output: $docs.output,
+            changes_from_previous: null
+        }') || {
+        print_warning "Failed to build round metrics record"
+        return 0
+    }
+
+    change_metrics=$(calculate_round_changes "$workflow" "$round_num" "$output_dir") || {
+        print_warning "Failed to calculate change metrics"
+        change_metrics="null"
+    }
+
+    round_record=$(echo "$round_record" | jq -c --argjson changes "$change_metrics" \
+        '.changes_from_previous = $changes') || {
+        print_warning "Failed to attach change metrics"
+        return 0
+    }
+
+    if metrics_write_round "$workflow" "$round_num" "$round_record"; then
+        verbose "Metrics written for round $round_num"
+    else
+        print_warning "Failed to write round metrics"
+    fi
+
+    if update_convergence_metrics "$workflow"; then
+        if confidence=$(metrics_read "$workflow" | jq -r '.convergence.confidence // 0' 2>/dev/null); then
+            if command -v bc &>/dev/null; then
+                is_high=$(echo "$confidence >= 0.75" | bc 2>/dev/null || echo "0")
+                if [[ "$is_high" -eq 1 ]]; then
+                    print_success "Specification appears to be converging (confidence: $confidence)"
+                else
+                    print_dim "Convergence confidence: $confidence"
+                fi
+            fi
+        else
+            print_warning "Failed to read convergence metrics"
+        fi
+    else
+        print_warning "Failed to update convergence metrics"
+    fi
+}
+
 # -----------------------------------------------------------------------------
 # Interactive Setup Wizard
 # -----------------------------------------------------------------------------
@@ -3239,14 +3389,14 @@ run_setup() {
     # Step 5: Review preferences
     print_step 5 5 "Review preferences"
     local model
-    model=$(choose "Select GPT model for reviews:" \
-        "5.2 Thinking (Extended Reasoning)" \
-        "gpt-5.2-pro" \
+    model=$(choose "Select API model for reviews:" \
+        "$APR_DEFAULT_MODEL" \
+        "gpt-5.5-pro" \
         "gpt-5.2")
 
     # Extract model name
     case "$model" in
-        "5.2 Thinking"*) model="5.2 Thinking" ;;
+        "5.2 Thinking"*) model="$APR_DEFAULT_MODEL" ;;
         *) ;;
     esac
 
@@ -3270,9 +3420,9 @@ documents:
   spec: $(yaml_quote "$spec_path")
   implementation: $(yaml_quote "${impl_path:-}")
 
-oracle:
+api:
   model: "$model"
-  thinking_time: heavy
+  reasoning_effort: high
 
 rounds:
   output_dir: $(yaml_quote "$CONFIG_DIR/rounds/$workflow_name")
@@ -3323,17 +3473,14 @@ run_round() {
     local render="${RENDER:-false}"
     local copy="${COPY:-false}"
     local wait_mode="${WAIT_MODE:-false}"
-    local manual_login="${MANUAL_LOGIN:-false}"
-    local keep_browser="${KEEP_BROWSER:-false}"
     local skip_preflight="${SKIP_PREFLIGHT:-false}"
-    local enable_retry="${ENABLE_RETRY:-true}"
+    local api_endpoint="${OPENAI_BASE_URL%/}/responses"
 
     print_banner
 
     verbose "Starting run_round: round=$round_num workflow=$workflow"
     verbose "Options: include_impl=$include_impl dry_run=$dry_run render=$render"
-    verbose "Options: wait_mode=$wait_mode manual_login=$manual_login"
-    verbose "Options: skip_preflight=$skip_preflight enable_retry=$enable_retry"
+    verbose "Options: wait_mode=$wait_mode skip_preflight=$skip_preflight"
 
     # Load workflow config
     local config_path="$CONFIG_DIR/workflows/$workflow.yaml"
@@ -3351,7 +3498,7 @@ run_round() {
     fi
 
     # Parse config (simple grep-based for now)
-    local readme_path spec_path impl_path model output_dir impl_every_n thinking_time
+    local readme_path spec_path impl_path model output_dir impl_every_n thinking_time reasoning_effort
     readme_path=$(yaml_unquote "$(get_config_value "readme" "$config_path")")
     spec_path=$(yaml_unquote "$(get_config_value "spec" "$config_path")")
     impl_path=$(yaml_unquote "$(get_config_value "implementation" "$config_path")")
@@ -3359,6 +3506,11 @@ run_round() {
     output_dir=$(yaml_unquote "$(get_config_value "output_dir" "$config_path")")
     impl_every_n=$(yaml_unquote "$(get_config_value "impl_every_n" "$config_path")")
     thinking_time=$(yaml_unquote "$(get_config_value "thinking_time" "$config_path")")
+    reasoning_effort=$(yaml_unquote "$(get_config_value "reasoning_effort" "$config_path")")
+    model=$(api_normalize_model "$model")
+    if [[ -z "$reasoning_effort" ]]; then
+        reasoning_effort=$(api_reasoning_effort "$thinking_time")
+    fi
 
     # Auto-include implementation every N rounds if configured
     if [[ -n "$impl_every_n" && "$impl_every_n" =~ ^[0-9]+$ && "$impl_every_n" -gt 0 ]]; then
@@ -3385,6 +3537,7 @@ run_round() {
     verbose "  Spec: $spec_path"
     verbose "  Implementation: ${impl_path:-<not configured>}"
     verbose "  Model: $model"
+    verbose "  Reasoning effort: $reasoning_effort"
     verbose "  Output dir: $output_dir"
     verbose "  impl_every_n: ${impl_every_n:-<not configured>}"
     verbose "  thinking_time: ${thinking_time:-<not configured>}"
@@ -3436,6 +3589,7 @@ run_round() {
     # Display round info
     local slug="apr-${workflow}-round-${round_num}"
     local output_file="${output_dir}/round_${round_num}.md"
+    local log_file=""
 
     if [[ "$include_impl" == "true" && -n "$impl_path" ]]; then
         slug="${slug}-with-impl"
@@ -3464,6 +3618,7 @@ run_round() {
             "" \
             "$(gum style --foreground 39 "Workflow:") $workflow" \
             "$(gum style --foreground 39 "Model:") $model" \
+            "$(gum style --foreground 39 "Reasoning:") $reasoning_effort" \
             "$(gum style --foreground 39 "Include impl:") $include_impl" \
             "$(gum style --foreground 39 "Output:") $output_file" >&2
     elif [[ "$QUIET_MODE" != "true" ]]; then
@@ -3472,17 +3627,11 @@ run_round() {
         echo "" >&2
         echo -e "  ${CYAN}Workflow:${NC}     $workflow" >&2
         echo -e "  ${CYAN}Model:${NC}        $model" >&2
+        echo -e "  ${CYAN}Reasoning:${NC}    $reasoning_effort" >&2
         echo -e "  ${CYAN}Include impl:${NC} $include_impl" >&2
         echo -e "  ${CYAN}Output:${NC}       $output_file" >&2
     fi
     echo "" >&2
-
-    # Build file arguments
-    local file_args=(--file "$readme_path")
-    if [[ "$include_impl" == "true" && -n "$impl_path" ]]; then
-        file_args+=(--file "$impl_path")
-    fi
-    file_args+=(--file "$spec_path")
 
     # Build prompt using shared function
     local prompt
@@ -3511,112 +3660,91 @@ run_round() {
         return 1
     fi
 
-    # Best-effort Oracle feature detection for accurate dry-run output and
-    # to enable optional flags when preflight is skipped.
-    # Note: In dry-run/render mode, preflight_check doesn't run, so check_oracle
-    # hasn't set ORACLE_CMD yet. Call it here if needed.
-    if [[ "$render" != "true" ]]; then
-        if [[ ${#ORACLE_CMD[@]} -eq 0 ]]; then
-            check_oracle || true
-        fi
-        if [[ "$dry_run" == "true" ]]; then
-            oracle_detect_features fast || true
-        else
-            oracle_detect_features || true
-        fi
-    fi
+    local bundle
+    bundle=$(render_prompt_bundle "$readme_path" "$spec_path" "$impl_path" "$include_impl" "$prompt")
 
     # Dry run mode
     if [[ "$dry_run" == "true" ]]; then
         print_header "DRY RUN"
         echo "" >&2
-        print_info "Would execute:"
+        print_info "Would create a background Responses API job:"
         echo "" >&2
-        echo "  ${ORACLE_CMD[*]} --engine browser \\" >&2
-        echo "    -m \"$model\" \\" >&2
-        for f in "${file_args[@]}"; do
-            echo "    $f \\" >&2
-        done
-        echo "    --browser-attachments never \\" >&2
-        echo "    --slug \"$slug\" \\" >&2
-        echo "    --write-output \"$output_file\" \\" >&2
-        [[ "$manual_login" == "true" ]] && echo "    --browser-manual-login \\" >&2
-        [[ "$keep_browser" == "true" ]] && echo "    --browser-keep-browser \\" >&2
-        [[ "$ORACLE_SUPPORTS_NOTIFY" == "true" ]] && echo "    --notify \\" >&2
-        [[ -n "$thinking_time" ]] && echo "    --browser-thinking-time \"$thinking_time\" \\" >&2
-        echo "    --heartbeat 30 \\" >&2
-        echo "    -p \"<prompt>\"" >&2
+        echo "  POST $api_endpoint" >&2
+        echo "    model: $model" >&2
+        echo "    reasoning.effort: $reasoning_effort" >&2
+        echo "    text.verbosity: ${APR_TEXT_VERBOSITY:-<default>}" >&2
+        echo "    max_output_tokens: $APR_MAX_OUTPUT_TOKENS" >&2
+        echo "    background: true" >&2
+        echo "    store: true" >&2
+        echo "    metadata.apr_slug: $slug" >&2
+        echo "    output_file: $output_file" >&2
+        echo "    prompt_chars: ${#bundle}" >&2
         exit $EXIT_SUCCESS
     fi
 
     # Render mode
     if [[ "$render" == "true" ]]; then
-        local render_args=("--render")
-        [[ "$copy" == "true" ]] && render_args+=("--copy")
-
-        print_info "Rendering bundle for manual use..."
-        "${ORACLE_CMD[@]}" "${file_args[@]}" "${render_args[@]}" -p "$prompt"
+        print_info "Rendering API prompt bundle for manual use..."
+        if [[ "$copy" == "true" ]]; then
+            if ! copy_text_to_clipboard "$bundle" "API prompt bundle"; then
+                printf '%s\n' "$bundle"
+            fi
+        else
+            printf '%s\n' "$bundle"
+        fi
         exit $EXIT_SUCCESS
+    fi
+
+    if ! check_api; then
+        print_error "Direct API not available: $API_ERROR_MESSAGE"
+        exit $EXIT_DEPENDENCY_ERROR
+    fi
+
+    if api_session_busy_for_round "$workflow" "$round_num"; then
+        print_error "An API session is already active for round $round_num in workflow '$workflow'"
+        print_info "Check progress with: apr status"
+        print_info "Attach with: apr attach $slug"
+        exit $EXIT_BUSY_ERROR
     fi
 
     # Acquire lock to prevent concurrent runs of the same workflow/round.
     if ! acquire_lock "$workflow" "$round_num"; then
         print_error "Another APR process is already running round $round_num for workflow '$workflow'"
         print_info "Wait for it to complete or check 'apr status'"
-        exit $EXIT_CONFIG_ERROR
+        exit $EXIT_BUSY_ERROR
     fi
 
-    # Build Oracle command
-    local oracle_args=(
-        --engine browser
-        -m "$model"
-        "${file_args[@]}"
-        --browser-attachments never  # Paste inline, never upload as files
-        --slug "$slug"
-        --write-output "$output_file"
-        --files-report
-        --heartbeat 30
-    )
-
-    [[ "$ORACLE_SUPPORTS_NOTIFY" == "true" ]] && oracle_args+=(--notify)
-    [[ "$manual_login" == "true" ]] && oracle_args+=(--browser-manual-login)
-    [[ "$keep_browser" == "true" ]] && oracle_args+=(--browser-keep-browser)
-    [[ -n "$thinking_time" ]] && oracle_args+=(--browser-thinking-time "$thinking_time")
-    oracle_args+=(-p "$prompt")
-
-    verbose "Oracle command: ${ORACLE_CMD[*]} ${oracle_args[*]}"
+    verbose "API endpoint: $api_endpoint"
     verbose "Output file: $output_file"
-    verbose "Session slug: $slug"
+    verbose "API session slug: $slug"
 
     # Create output directory
     mkdir -p "$(dirname "$output_file")"
 
     # Execute
-    print_info "Starting GPT Pro Extended Reasoning review..."
+    print_info "Creating background Responses API review..."
     print_dim "This may take 10-60 minutes depending on complexity."
     echo "" >&2
 
-    if [[ "$manual_login" == "true" ]]; then
-        print_warning "Manual login mode enabled"
-        print_dim "Chrome will open - log into ChatGPT if prompted"
-        print_dim "Your session will be saved for future runs"
-        echo "" >&2
+    if ! api_create_response_record "$slug" "$workflow" "$round_num" "$include_impl" \
+        "$model" "$output_file" "$bundle" "$reasoning_effort" true; then
+        release_lock 2>/dev/null || true
+        print_error "API request failed: $API_ERROR_MESSAGE"
+        exit $EXIT_NETWORK_ERROR
     fi
+
+    log_file=$(api_response_log_path "$slug")
 
     if [[ "$wait_mode" == "true" ]]; then
         print_info "Running in foreground (--wait)..."
-        [[ "$enable_retry" == "true" ]] && print_dim "Auto-retry enabled (up to $MAX_RETRY_ATTEMPTS attempts)"
+        print_info "Response ID: $API_RESPONSE_ID"
         print_dim "Elapsed time will be shown on completion."
         echo "" >&2
-        local start_time oracle_exit=0
+        local start_time api_exit=0
         start_time=$(date +%s)
 
-        # Use auto-retry wrapper if enabled
-        if [[ "$enable_retry" == "true" ]]; then
-            run_oracle_with_retry "${oracle_args[@]}" || oracle_exit=$?
-        else
-            "${ORACLE_CMD[@]}" "${oracle_args[@]}" || oracle_exit=$?
-        fi
+        api_poll_response "$slug" "$API_RESPONSE_ID" "$output_file" "$log_file" || api_exit=$?
+        release_lock 2>/dev/null || true
 
         local end_time elapsed_secs elapsed_fmt
         end_time=$(date +%s)
@@ -3629,161 +3757,43 @@ run_round() {
         fi
         echo "" >&2
 
-        if [[ $oracle_exit -eq 0 ]]; then
-            # Validate output file for completeness
+        if [[ $api_exit -eq 0 ]]; then
+            OUTPUT_VALIDATION_REASON=""
             if ! validate_output_file "$output_file"; then
                 print_warning "Output validation failed: $OUTPUT_VALIDATION_REASON"
-                print_info "Attempting automatic recovery via Oracle session reattach..."
-                echo "" >&2
-
-                # Try to recover via Oracle session reattach
-                local recovery_success=false
-                local recovery_output_file="${output_file}.recovery"
-
-                # Wait a bit for ChatGPT to complete if it's still generating
-                print_dim "Waiting 30s for ChatGPT to complete generation..."
-                sleep 30
-
-                # Try to get the full output via session reattach
-                if "${ORACLE_CMD[@]}" session "$slug" --write-output "$recovery_output_file" 2>/dev/null; then
-                    if validate_output_file "$recovery_output_file"; then
-                        # Recovery successful - replace truncated output
-                        mv "$recovery_output_file" "$output_file"
-                        OUTPUT_VALIDATION_REASON=""
-                        recovery_success=true
-                        print_success "Recovery successful! Full output retrieved via session reattach."
-                    else
-                        rm -f "$recovery_output_file"
-                        verbose "Recovery output also invalid: $OUTPUT_VALIDATION_REASON"
-                    fi
-                else
-                    # Clean up any partial recovery file that might have been created
-                    rm -f "$recovery_output_file" 2>/dev/null
-                    verbose "Oracle session reattach failed for slug: $slug"
-                fi
-
-                if [[ "$recovery_success" != "true" ]]; then
-                    print_error "Automatic recovery failed"
-                    print_warning "The response was truncated by Oracle's browser automation."
-                    print_info "This happens when GPT Pro Extended Thinking pauses during reasoning."
-                    echo "" >&2
-                    print_info "Manual recovery options:"
-                    print_info "  1. Re-run the round: apr run $round_num --wait"
-                    print_info "  2. Check the Oracle session: apr attach $slug"
-                    print_info "  3. File an issue if this persists: https://github.com/steipete/oracle/issues"
-                    echo "" >&2
-                    print_info "Partial output saved to: $output_file"
-                    # Continue but mark as incomplete for metrics
-                fi
-            fi
-
-            if [[ -z "$OUTPUT_VALIDATION_REASON" ]]; then
-                print_success "Review complete! (${elapsed_fmt} elapsed)"
-                print_info "Output saved to: $output_file"
-            fi
-
-            # Best-effort metrics collection (skip if output is invalid)
-            if [[ -n "$OUTPUT_VALIDATION_REASON" ]]; then
-                print_warning "Skipping metrics collection due to invalid output"
-            elif command -v jq &>/dev/null; then
-                local doc_metrics round_record
-                doc_metrics=$(collect_round_document_metrics "$workflow" "$round_num" \
-                    "$readme_path" "$spec_path" "$impl_path" "$output_file") || {
-                    print_warning "Metrics collection failed; continuing without analytics"
-                }
-
-                if [[ -n "${doc_metrics:-}" ]]; then
-                    round_record=$(jq -nc \
-                        --argjson num "$round_num" \
-                        --arg ts "$(iso_timestamp)" \
-                        --argjson docs "$doc_metrics" \
-                        '{
-                            round: $num,
-                            timestamp: $ts,
-                            documents: {
-                                readme: $docs.readme,
-                                spec: $docs.spec,
-                                implementation: $docs.implementation
-                            },
-                            output: $docs.output,
-                            changes_from_previous: null
-                        }') || {
-                        print_warning "Failed to build round metrics record"
-                    }
-
-                    if [[ -n "${round_record:-}" ]]; then
-                        local change_metrics
-                        change_metrics=$(calculate_round_changes "$workflow" "$round_num" "$output_dir") || {
-                            print_warning "Failed to calculate change metrics"
-                            change_metrics="null"
-                        }
-
-                        if [[ -n "${change_metrics:-}" ]]; then
-                            round_record=$(echo "$round_record" | jq -c --argjson changes "$change_metrics" \
-                                '.changes_from_previous = $changes') || {
-                                print_warning "Failed to attach change metrics"
-                            }
-                        fi
-
-                        if metrics_write_round "$workflow" "$round_num" "$round_record"; then
-                            verbose "Metrics written for round $round_num"
-                        else
-                            print_warning "Failed to write round metrics"
-                        fi
-
-                        if update_convergence_metrics "$workflow"; then
-                            local confidence is_high
-                            if confidence=$(metrics_read "$workflow" | jq -r '.convergence.confidence // 0' 2>/dev/null); then
-                                if command -v bc &>/dev/null; then
-                                    is_high=$(echo "$confidence >= 0.75" | bc 2>/dev/null || echo "0")
-                                    if [[ "$is_high" -eq 1 ]]; then
-                                        print_success "Specification appears to be converging (confidence: $confidence)"
-                                    else
-                                        print_dim "Convergence confidence: $confidence"
-                                    fi
-                                fi
-                            else
-                                print_warning "Failed to read convergence metrics"
-                            fi
-                        else
-                            print_warning "Failed to update convergence metrics"
-                        fi
-                    fi
-                fi
+                print_warning "Metrics collection skipped because the output looks incomplete"
             else
-                print_warning "jq not available; skipping metrics collection"
+                record_completed_round_metrics "$workflow" "$round_num" \
+                    "$readme_path" "$spec_path" "$impl_path" "$output_file" "$output_dir"
             fi
+            print_success "Review complete! (${elapsed_fmt} elapsed)"
+            print_info "Output saved to: $output_file"
         else
-            print_error "Oracle failed after ${elapsed_fmt} (exit code: $oracle_exit)"
-            exit $oracle_exit
+            print_error "API response failed after ${elapsed_fmt}: $API_ERROR_MESSAGE"
+            print_info "Response ID: $API_RESPONSE_ID"
+            print_info "Cached response JSON: $log_file"
+            exit $EXIT_NETWORK_ERROR
         fi
     else
-        (
-            # Bash will SIGHUP background jobs on shell exit. Ignore HUP so the
-            # background run keeps going after `apr run` returns.
-            trap "" HUP
-            if [[ "$enable_retry" == "true" ]]; then
-                run_oracle_with_retry "${oracle_args[@]}"
+        if api_terminal_status "$API_RESPONSE_STATUS"; then
+            api_update_session_from_response "$slug" "$log_file"
+            if [[ "$API_RESPONSE_STATUS" == "completed" ]]; then
+                api_write_response_output "$log_file" "$output_file" || true
             else
-                "${ORACLE_CMD[@]}" "${oracle_args[@]}"
+                release_lock 2>/dev/null || true
+                print_error "API response ended immediately with status: $API_RESPONSE_STATUS"
+                print_info "Cached response JSON: $log_file"
+                exit $EXIT_NETWORK_ERROR
             fi
-        ) &
-        local oracle_pid=$!
-
-        # Brief delay to verify process started
-        sleep 0.5
-
-        # Verify the process is actually running
-        if ! kill -0 "$oracle_pid" 2>/dev/null; then
-            release_lock 2>/dev/null || true
-            print_error "Oracle process failed to start"
-            print_info "Try running with --wait to see error output"
-            exit $EXIT_DEPENDENCY_ERROR
         fi
+        release_lock 2>/dev/null || true
 
-        background_lock_detach_parent "$oracle_pid"
-
-        print_success "Oracle running in background (PID: $oracle_pid)"
+        if [[ "$API_RESPONSE_STATUS" == "completed" ]]; then
+            print_success "API review completed immediately"
+        else
+            print_success "API review queued in background"
+        fi
+        print_info "Response ID: $API_RESPONSE_ID"
         echo "" >&2
 
         if [[ "$GUM_AVAILABLE" == "true" && "$QUIET_MODE" != "true" ]]; then
@@ -3795,17 +3805,18 @@ run_round() {
                 "" \
                 "Check status:      $(gum style --foreground 82 "apr status")" \
                 "Attach to session: $(gum style --foreground 82 "apr attach $slug")" \
-                "View with output:  $(gum style --foreground 82 "${ORACLE_CMD[*]} session $slug --render")" >&2
+                "Response ID:       $(gum style --foreground 82 "$API_RESPONSE_ID")" >&2
         elif [[ "$QUIET_MODE" != "true" ]]; then
             echo -e "  ${BOLD}${CYAN}MONITORING COMMANDS${NC}" >&2
             echo "" >&2
             echo -e "  Check status:      ${GREEN}apr status${NC}" >&2
             echo -e "  Attach to session: ${GREEN}apr attach $slug${NC}" >&2
-            echo -e "  View with output:  ${GREEN}${ORACLE_CMD[*]} session $slug --render${NC}" >&2
+            echo -e "  Response ID:       ${GREEN}$API_RESPONSE_ID${NC}" >&2
         fi
 
         echo "" >&2
         print_info "Output will be saved to: $output_file"
+        print_info "Cached response JSON: $log_file"
     fi
 
     echo "" >&2
@@ -3833,9 +3844,7 @@ run_round() {
     echo "" >&2
 
     # Contextual suggestions
-    if [[ "$round_num" == "1" && "$manual_login" != "true" ]]; then
-        print_dim "Tip: For first runs, use --login to handle browser authentication"
-    elif [[ -n "$impl_every_n" && "$impl_every_n" =~ ^[0-9]+$ && "$impl_every_n" -gt 0 ]]; then
+    if [[ -n "$impl_every_n" && "$impl_every_n" =~ ^[0-9]+$ && "$impl_every_n" -gt 0 ]]; then
         local next_impl_round=$(( ((round_num / impl_every_n) + 1) * impl_every_n ))
         if [[ "$include_impl" == "true" ]]; then
             print_dim "Tip: This round includes impl (every $impl_every_n rounds)"
@@ -3853,23 +3862,223 @@ run_round() {
 # Status & Session Management
 # -----------------------------------------------------------------------------
 
+api_session_status_is_active() {
+    case "$1" in
+        queued|in_progress|requires_action) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+api_refresh_session_record_from_path() {
+    local record_path="$1"
+    local slug response_id output_file log_file status
+
+    [[ -f "$record_path" ]] || return 1
+    slug=$(jq -r '.slug // empty' "$record_path" 2>/dev/null || true)
+    response_id=$(jq -r '.response_id // empty' "$record_path" 2>/dev/null || true)
+    output_file=$(jq -r '.output_file // empty' "$record_path" 2>/dev/null || true)
+    log_file=$(jq -r '.log_file // empty' "$record_path" 2>/dev/null || true)
+
+    [[ -n "$slug" && -n "$response_id" ]] || return 1
+    [[ -n "$log_file" ]] || log_file=$(api_response_log_path "$slug")
+    mkdir -p "$(dirname "$log_file")"
+
+    if ! api_call "GET" "/responses/$response_id" "" "$log_file"; then
+        return 1
+    fi
+
+    api_update_session_from_response "$slug" "$log_file"
+    status=$(api_response_status "$log_file")
+    if [[ "$status" == "completed" && -n "$output_file" ]]; then
+        api_write_response_output "$log_file" "$output_file" || true
+    fi
+}
+
+api_iso_to_epoch() {
+    local ts="$1"
+    local epoch=""
+
+    [[ -n "$ts" && "$ts" != "null" ]] || return 1
+    epoch=$(date -d "$ts" '+%s' 2>/dev/null || date -j -f '%Y-%m-%dT%H:%M:%SZ' "$ts" '+%s' 2>/dev/null || true)
+    [[ "$epoch" =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "$epoch"
+}
+
+api_session_record_within_hours() {
+    local record_path="$1"
+    local hours="$2"
+    local created_at created_epoch now_epoch window_secs
+
+    [[ "$hours" -gt 0 ]] || return 0
+    created_at=$(jq -r '.created_at // empty' "$record_path" 2>/dev/null || true)
+    created_epoch=$(api_iso_to_epoch "$created_at" 2>/dev/null || true)
+    [[ -n "$created_epoch" ]] || return 0
+
+    now_epoch=$(date +%s)
+    window_secs=$((hours * 3600))
+    (( now_epoch - created_epoch <= window_secs ))
+}
+
 show_status() {
     print_banner
-    print_header "ORACLE SESSION STATUS"
+    print_header "API SESSION STATUS"
     if ! is_non_negative_int "${STATUS_HOURS:-}"; then
         STATUS_HOURS=72
     fi
-    print_info "Showing sessions from last ${STATUS_HOURS}h"
+    print_info "Showing APR API sessions from last ${STATUS_HOURS}h"
     echo "" >&2
-    "${ORACLE_CMD[@]}" status --hours "$STATUS_HOURS"
+
+    if ! command -v jq &>/dev/null; then
+        print_error "jq is required to read API session records"
+        exit $EXIT_DEPENDENCY_ERROR
+    fi
+
+    local sessions_dir record found_any=false api_refresh=false
+    sessions_dir=$(api_sessions_dir)
+    if [[ ! -d "$sessions_dir" ]]; then
+        print_warning "No API sessions found"
+        print_info "Run 'apr run <round>' to create one"
+        return 0
+    fi
+
+    if check_api; then
+        api_refresh=true
+    else
+        print_warning "API refresh skipped: $API_ERROR_MESSAGE"
+        API_ERROR_MESSAGE=""
+    fi
+
+    printf "  %-34s %-14s %-28s %-12s %-6s %s\n" "SLUG" "STATUS" "RESPONSE ID" "WORKFLOW" "ROUND" "OUTPUT" >&2
+    printf "  %-34s %-14s %-28s %-12s %-6s %s\n" "----" "------" "-----------" "--------" "-----" "------" >&2
+
+    for record in "$sessions_dir"/*.json; do
+        [[ -f "$record" ]] || continue
+        if ! api_session_record_within_hours "$record" "$STATUS_HOURS"; then
+            continue
+        fi
+        found_any=true
+
+        local slug status response_id workflow round output_file
+        status=$(jq -r '.status // "unknown"' "$record" 2>/dev/null || echo "unknown")
+        if [[ "$api_refresh" == "true" ]] && api_session_status_is_active "$status"; then
+            if ! api_refresh_session_record_from_path "$record"; then
+                print_warning "Could not refresh $(basename "$record" .json): $API_ERROR_MESSAGE"
+            fi
+            API_ERROR_MESSAGE=""
+        fi
+
+        slug=$(jq -r '.slug // empty' "$record" 2>/dev/null || true)
+        status=$(jq -r '.status // "unknown"' "$record" 2>/dev/null || echo "unknown")
+        response_id=$(jq -r '.response_id // empty' "$record" 2>/dev/null || true)
+        workflow=$(jq -r '.workflow // ""' "$record" 2>/dev/null || true)
+        round=$(jq -r '.round // ""' "$record" 2>/dev/null || true)
+        output_file=$(jq -r '.output_file // ""' "$record" 2>/dev/null || true)
+
+        printf "  %-34s %-14s %-28s %-12s %-6s %s\n" \
+            "$slug" "$status" "$response_id" "$workflow" "$round" "$output_file" >&2
+    done
+
+    if [[ "$found_any" != "true" ]]; then
+        print_warning "No API sessions found"
+    fi
 }
 
 attach_session() {
     local session="$1"
     print_banner
-    print_info "Attaching to session: $session"
+    print_info "Attaching to API session: $session"
     echo "" >&2
-    "${ORACLE_CMD[@]}" session "$session" --render
+
+    if ! command -v jq &>/dev/null; then
+        print_error "jq is required to read API session records"
+        exit $EXIT_DEPENDENCY_ERROR
+    fi
+
+    local record_path="" slug response_id output_file log_file status output_text
+    record_path=$(api_find_session_record "$session" 2>/dev/null || true)
+
+    if [[ -n "$record_path" ]]; then
+        slug=$(jq -r '.slug // empty' "$record_path" 2>/dev/null || true)
+        response_id=$(jq -r '.response_id // empty' "$record_path" 2>/dev/null || true)
+        output_file=$(jq -r '.output_file // empty' "$record_path" 2>/dev/null || true)
+        log_file=$(jq -r '.log_file // empty' "$record_path" 2>/dev/null || true)
+        [[ -n "$log_file" ]] || log_file=$(api_response_log_path "$slug")
+
+        if check_api; then
+            api_refresh_session_record_from_path "$record_path" || {
+                print_warning "Could not refresh API response: $API_ERROR_MESSAGE"
+                API_ERROR_MESSAGE=""
+            }
+        else
+            print_warning "API refresh skipped: $API_ERROR_MESSAGE"
+            API_ERROR_MESSAGE=""
+        fi
+
+        status=$(jq -r '.status // "unknown"' "$record_path" 2>/dev/null || echo "unknown")
+        print_info "Status: $status"
+        print_info "Response ID: $response_id"
+
+        if [[ "$status" == "completed" ]]; then
+            if [[ -n "$output_file" && -f "$output_file" ]]; then
+                cat "$output_file"
+                return 0
+            fi
+            output_text=$(api_response_output_text "$log_file")
+            if [[ -n "$output_text" ]]; then
+                printf '%s\n' "$output_text"
+                return 0
+            fi
+            print_error "Completed response has no cached output text"
+            print_info "Cached response JSON: $log_file"
+            exit $EXIT_CONFIG_ERROR
+        fi
+
+        if api_terminal_status "$status"; then
+            print_error "API response ended with status: $status"
+            print_info "Cached response JSON: $log_file"
+            exit $EXIT_NETWORK_ERROR
+        fi
+
+        print_info "Response is still running. Re-run 'apr attach $session' later."
+        print_info "Cached response JSON: $log_file"
+        return 0
+    fi
+
+    if ! check_api; then
+        print_error "Session record not found and API is unavailable: $API_ERROR_MESSAGE"
+        exit $EXIT_CONFIG_ERROR
+    fi
+
+    slug="$session"
+    response_id="$session"
+    log_file=$(api_response_log_path "$slug")
+    mkdir -p "$(dirname "$log_file")"
+
+    if ! api_call "GET" "/responses/$response_id" "" "$log_file"; then
+        print_error "API response not found: $API_ERROR_MESSAGE"
+        exit $EXIT_NETWORK_ERROR
+    fi
+
+    status=$(api_response_status "$log_file")
+    print_info "Status: $status"
+    print_info "Response ID: $response_id"
+
+    if [[ "$status" == "completed" ]]; then
+        output_text=$(api_response_output_text "$log_file")
+        if [[ -n "$output_text" ]]; then
+            printf '%s\n' "$output_text"
+            return 0
+        fi
+        print_error "Completed response has no output text"
+        exit $EXIT_CONFIG_ERROR
+    fi
+
+    if api_terminal_status "$status"; then
+        print_error "API response ended with status: $status"
+        exit $EXIT_NETWORK_ERROR
+    fi
+
+    print_info "Response is still running. Re-run 'apr attach $session' later."
 }
 
 # -----------------------------------------------------------------------------
@@ -4205,7 +4414,7 @@ and understand ALL of both! Then use your code investigation agent mode
 to fully understand the code and technical architecture of the project.
 Read ALL of the specification document at: $spec_path
 
-Now integrate the following feedback from GPT Pro 5.2 Extended Reasoning
+Now integrate the following API review feedback
 (Round $round_num of the APR iterative refinement process). For each
 suggestion, carefully evaluate whether you agree with the proposed change.
 Then apply the changes you endorse to the specification document.
@@ -5776,8 +5985,8 @@ robot_status() {
     local configured=false
     local default_workflow=""
     local workflow_count=0
-    local oracle_available=false
-    local oracle_method=""
+    local api_available=false
+    local api_error=""
     local workflows_json="[]"
 
     # Check configuration
@@ -5801,13 +6010,12 @@ robot_status() {
         workflows_json=$(printf '%s\n' "${workflow_names[@]}" | jq -Rsc 'split("\n") | map(select(length>0))')
     fi
 
-    # Check Oracle
-    if command -v oracle &>/dev/null; then
-        oracle_available=true
-        oracle_method="global"
-    elif [[ -z "${APR_NO_NPX:-}" ]] && command -v npx &>/dev/null; then
-        oracle_available=true
-        oracle_method="npx"
+    # Check direct API readiness.
+    if check_api; then
+        api_available=true
+    else
+        api_error="$API_ERROR_MESSAGE"
+        API_ERROR_MESSAGE=""
     fi
 
     # Build data object with jq
@@ -5817,8 +6025,9 @@ robot_status() {
         --arg default_workflow "$default_workflow" \
         --argjson workflow_count "$workflow_count" \
         --argjson workflows "$workflows_json" \
-        --argjson oracle_available "$oracle_available" \
-        --arg oracle_method "$oracle_method" \
+        --argjson api_available "$api_available" \
+        --arg api_base_url "${OPENAI_BASE_URL%/}" \
+        --arg api_error "$api_error" \
         --arg config_dir "$CONFIG_DIR" \
         --arg apr_home "$APR_HOME" \
         '{
@@ -5826,8 +6035,9 @@ robot_status() {
             default_workflow: $default_workflow,
             workflow_count: $workflow_count,
             workflows: $workflows,
-            oracle_available: $oracle_available,
-            oracle_method: $oracle_method,
+            api_available: $api_available,
+            api_base_url: $api_base_url,
+            api_error: (if $api_error == "" then null else $api_error end),
             config_dir: $config_dir,
             apr_home: $apr_home
         }')
@@ -5835,8 +6045,8 @@ robot_status() {
     local hint=""
     if [[ "$configured" == "false" ]]; then
         hint="Run 'apr robot init' to initialize, then 'apr setup' to create workflow"
-    elif [[ "$oracle_available" == "false" ]]; then
-        hint="Install Oracle: npm install -g @steipete/oracle"
+    elif [[ "$api_available" == "false" ]]; then
+        hint="Set OPENAI_API_KEY and ensure curl/jq are available"
     fi
 
     robot_json true "ok" "$data" "$hint"
@@ -5931,7 +6141,7 @@ robot_validate() {
             errors+=("Output directory not configured in workflow")
         fi
 
-        # Prompt quality checks (fail fast before expensive Oracle runs).
+        # Prompt quality checks (fail fast before expensive API runs).
         local prompt_no_impl=""
         prompt_no_impl=$(build_revision_prompt "false" "$wf_file" 2>/dev/null || echo "")
         if [[ -n "$prompt_no_impl" ]]; then
@@ -5949,11 +6159,10 @@ robot_validate() {
         fi
     fi
 
-    # Check Oracle
-    if ! command -v oracle &>/dev/null; then
-        if [[ -n "${APR_NO_NPX:-}" ]] || ! command -v npx &>/dev/null; then
-            errors+=("Oracle not available")
-        fi
+    # Check direct API readiness.
+    if ! check_api; then
+        errors+=("Direct API not available: $API_ERROR_MESSAGE")
+        API_ERROR_MESSAGE=""
     fi
 
     # Check for previous round if not round 1
@@ -6016,12 +6225,14 @@ robot_run() {
         return $?
     fi
 
-    # Check Oracle
-    if ! check_oracle; then
-        robot_fail "dependency_missing" '{"dependency":"oracle"}' "Oracle not available"
+    # Check direct API dependencies before doing expensive prompt assembly.
+    if ! check_api; then
+        local api_error="$API_ERROR_MESSAGE"
+        API_ERROR_MESSAGE=""
+        robot_fail "dependency_missing" "$(jq -nc --arg error "$api_error" '{dependency:"openai_api", error:$error}')" \
+            "Set OPENAI_API_KEY and ensure curl/jq are available"
         return $?
     fi
-    oracle_detect_features || true
 
     # Load workflow config
     local config_path="$CONFIG_DIR/workflows/$workflow.yaml"
@@ -6031,13 +6242,19 @@ robot_run() {
     fi
 
     # Parse config
-    local readme_path spec_path impl_path model output_dir impl_every_n
+    local readme_path spec_path impl_path model output_dir impl_every_n thinking_time reasoning_effort
     readme_path=$(yaml_unquote "$(get_config_value "readme" "$config_path")")
     spec_path=$(yaml_unquote "$(get_config_value "spec" "$config_path")")
     impl_path=$(yaml_unquote "$(get_config_value "implementation" "$config_path")")
     model=$(yaml_unquote "$(get_config_value "model" "$config_path")")
     output_dir=$(yaml_unquote "$(get_config_value "output_dir" "$config_path")")
     impl_every_n=$(yaml_unquote "$(get_config_value "impl_every_n" "$config_path")")
+    thinking_time=$(yaml_unquote "$(get_config_value "thinking_time" "$config_path")")
+    reasoning_effort=$(yaml_unquote "$(get_config_value "reasoning_effort" "$config_path")")
+    model=$(api_normalize_model "$model")
+    if [[ -z "$reasoning_effort" ]]; then
+        reasoning_effort=$(api_reasoning_effort "$thinking_time")
+    fi
 
     # Auto-include implementation every N rounds if configured
     if [[ -n "$impl_every_n" && "$impl_every_n" =~ ^[0-9]+$ && "$impl_every_n" -gt 0 ]]; then
@@ -6086,6 +6303,12 @@ robot_run() {
         return $?
     fi
 
+    if api_session_busy_for_round "$workflow" "$round_num"; then
+        robot_fail "busy" "$(jq -nc --arg wf "$workflow" --argjson r "$round_num" '{workflow: $wf, round: $r}')" \
+            "An API session is already active for this round"
+        return $?
+    fi
+
     # Acquire lock so concurrent robot runs can't trample the same workflow/round.
     local lock_file="$CONFIG_DIR/.locks/${workflow}_round_${round_num}.lock"
     if ! acquire_lock "$workflow" "$round_num"; then
@@ -6095,13 +6318,6 @@ robot_run() {
             "Another APR process is already running this round"
         return $?
     fi
-
-    # Build file arguments
-    local file_args=(--file "$readme_path")
-    if [[ "$include_impl" == "true" && -n "$impl_path" && -f "$impl_path" ]]; then
-        file_args+=(--file "$impl_path")
-    fi
-    file_args+=(--file "$spec_path")
 
     # Build prompt using shared function
     local prompt
@@ -6120,6 +6336,9 @@ robot_run() {
         return $?
     fi
 
+    local bundle
+    bundle=$(render_prompt_bundle "$readme_path" "$spec_path" "$impl_path" "$include_impl" "$prompt")
+
     # Create output directory
     if ! mkdir -p "$(dirname "$output_file")" 2>/dev/null; then
         release_lock 2>/dev/null || true
@@ -6128,71 +6347,48 @@ robot_run() {
         return $?
     fi
 
-    # Build Oracle command
-    local oracle_args=(
-        --engine browser
-        -m "$model"
-        "${file_args[@]}"
-        --browser-attachments never  # Paste inline, never upload as files
-        --slug "$slug"
-        --write-output "$output_file"
-        --files-report
-        --heartbeat 30
-        -p "$prompt"
-    )
-
-    [[ "$ORACLE_SUPPORTS_NOTIFY" == "true" ]] && oracle_args+=(--notify)
-
-    verbose "robot_run Oracle command: ${ORACLE_CMD[*]} ${oracle_args[*]}"
-    verbose "robot_run output_file: $output_file"
-
-    # Execute in background (always use retry for reliability in robot mode).
-    # Important: robot mode must keep output clean; capture all Oracle/retry output to a log file.
-    local logs_dir="$CONFIG_DIR/logs"
-    local oracle_log="/dev/null"
-    if mkdir -p "$logs_dir" 2>/dev/null; then
-        oracle_log="$logs_dir/oracle_${slug}.log"
-    fi
-
-    (
-        # Bash will SIGHUP background jobs on shell exit. Ignore HUP so the
-        # detached robot run can survive after `apr` exits.
-        trap "" HUP
-        run_oracle_with_retry "${oracle_args[@]}"
-    ) >"$oracle_log" 2>&1 &
-    local oracle_pid=$!
-
-    # Brief delay to verify process started
-    sleep 0.5
-
-    # Verify the process is actually running
-    if ! kill -0 "$oracle_pid" 2>/dev/null; then
+    if ! api_create_response_record "$slug" "$workflow" "$round_num" "$include_impl" \
+        "$model" "$output_file" "$bundle" "$reasoning_effort" true; then
+        local create_error="$API_ERROR_MESSAGE"
+        API_ERROR_MESSAGE=""
         release_lock 2>/dev/null || true
-        robot_fail "internal_error" '{"reason":"process_start_failed"}' "Oracle process failed to start immediately"
+        robot_fail "network_error" "$(jq -nc --arg error "$create_error" '{error:$error}')" "API request failed"
         return $?
     fi
 
-    background_lock_detach_parent "$oracle_pid"
+    local api_log
+    api_log=$(api_response_log_path "$slug")
+    if [[ "$API_RESPONSE_STATUS" == "completed" ]]; then
+        api_write_response_output "$api_log" "$output_file" || true
+        api_update_session_from_response "$slug" "$api_log"
+    fi
+    release_lock 2>/dev/null || true
 
     # Return session info
     local data
     data=$(jq -nc \
         --arg slug "$slug" \
-        --argjson pid "$oracle_pid" \
+        --arg response_id "$API_RESPONSE_ID" \
+        --arg api_status "$API_RESPONSE_STATUS" \
+        --arg model "$model" \
+        --arg reasoning_effort "$reasoning_effort" \
         --arg output_file "$output_file" \
-        --arg log_file "$oracle_log" \
+        --arg log_file "$api_log" \
         --arg workflow "$workflow" \
         --arg round "$round_num" \
         --argjson include_impl "$include_impl" \
         '{
             slug: $slug,
-            pid: $pid,
+            response_id: $response_id,
+            api_status: $api_status,
+            model: $model,
+            reasoning_effort: $reasoning_effort,
             output_file: $output_file,
             log_file: $log_file,
             workflow: $workflow,
             round: ($round | tonumber),
             include_impl: $include_impl,
-            status: "running"
+            status: $api_status
         }')
 
     robot_json true "ok" "$data" "Use 'apr status' or 'apr attach $slug' to monitor"
@@ -6511,7 +6707,7 @@ PROMPT_HEADER
     prompt+="
 Read ALL of the specification document at: $spec_path
 
-Now integrate the following feedback from GPT Pro 5.2 Extended Reasoning
+Now integrate the following API review feedback
 (Round $round_num of the APR iterative refinement process). For each
 suggestion, carefully evaluate whether you agree with the proposed change.
 Then apply the changes you endorse to the specification document.
@@ -6551,11 +6747,11 @@ robot_help() {
         description: "Robot mode for coding agents - JSON interface to APR",
         usage: "apr robot <command> [args] [options]",
         commands: {
-            status: "System overview (config, workflows, oracle)",
+            status: "System overview (config, workflows, api)",
             workflows: "List all workflows with descriptions",
             init: "Initialize .apr directory",
             validate: "Pre-run validation (apr robot validate <round>)",
-            run: "Execute revision round (apr robot run <round>)",
+            run: "Create API-backed revision round (apr robot run <round>)",
             show: "View round content (apr robot show <round>)",
             diff: "Compare rounds (apr robot diff <N> [M])",
             integrate: "Get Claude integration prompt (apr robot integrate <round>)",
@@ -6726,7 +6922,7 @@ show_help() {
     if [[ "$GUM_AVAILABLE" == "true" ]]; then
         gum style --foreground 214 --bold "DESCRIPTION" >&2
         gum style --padding "0 2" "Automated Plan Reviser Pro automates iterative specification" >&2
-        gum style --padding "0 2" "refinement using GPT Pro Extended Reasoning via Oracle." >&2
+        gum style --padding "0 2" "refinement using OpenAI Responses API background jobs." >&2
         echo "" >&2
 
         gum style --foreground 214 --bold "SYNOPSIS" >&2
@@ -6737,7 +6933,7 @@ show_help() {
         gum style --foreground 39 "  Core Workflow" >&2
         echo "    $(gum style --foreground 82 'run <round>')        Run a revision round" >&2
         echo "    $(gum style --foreground 82 'setup')              Interactive workflow setup wizard" >&2
-        echo "    $(gum style --foreground 82 'status')             Check Oracle session status" >&2
+        echo "    $(gum style --foreground 82 'status')             Check API session status" >&2
         echo "    $(gum style --foreground 82 'attach <session>')   Attach to running/completed session" >&2
         echo "" >&2
         gum style --foreground 39 "  Management" >&2
@@ -6746,7 +6942,6 @@ show_help() {
         echo "    $(gum style --foreground 82 'show <round>')       View round output" >&2
         echo "    $(gum style --foreground 82 'backfill')           Generate metrics from existing rounds" >&2
         echo "    $(gum style --foreground 82 'update')             Check for and install updates" >&2
-        echo "    $(gum style --foreground 82 'restore-oracle')     Restore Oracle stability patch backup" >&2
         echo "    $(gum style --foreground 82 'help')               Show this help message" >&2
         echo "" >&2
         gum style --foreground 39 "  Analysis" >&2
@@ -6762,15 +6957,12 @@ show_help() {
         gum style --foreground 214 --bold "OPTIONS" >&2
         gum style --faint "  -w, --workflow NAME  Workflow to use (default: from config)" >&2
         gum style --faint "  -i, --include-impl   Include implementation document" >&2
-        gum style --faint "  -d, --dry-run        Preview without sending to GPT Pro" >&2
+        gum style --faint "  -d, --dry-run        Preview without creating an API job" >&2
         gum style --faint "  -r, --render         Render bundle for manual paste" >&2
         gum style --faint "  -c, --copy           Copy rendered bundle to clipboard" >&2
         gum style --faint "  -o, --output FILE    Output to file (integrate/export)" >&2
         gum style --faint "  --wait               Wait for completion (blocking)" >&2
-        gum style --faint "  --login              Manual login mode (first-time setup)" >&2
-        gum style --faint "  --keep-browser       Keep browser open after completion" >&2
         gum style --faint "  --no-preflight       Skip pre-flight validation checks" >&2
-        gum style --faint "  --retry/--no-retry   Enable/disable auto-retry (default: enabled)" >&2
         gum style --faint "  --hours NUM          Status window in hours (default: 72)" >&2
         gum style --faint "  --detailed           Show detailed metrics in stats" >&2
         gum style --faint "  --json               Output stats as raw JSON" >&2
@@ -6790,8 +6982,9 @@ show_help() {
         gum style --faint "  APR_CHECK_UPDATES    Enable daily update checking (set to 1)" >&2
         gum style --faint "  APR_STATUS_HOURS     Default status time window (default: 72)" >&2
         gum style --faint "  APR_VERBOSE          Enable verbose mode (set to true)" >&2
-        gum style --faint "  APR_MAX_RETRIES      Max retry attempts (default: 3)" >&2
-        gum style --faint "  APR_INITIAL_BACKOFF  Initial retry backoff in seconds (default: 10)" >&2
+        gum style --faint "  OPENAI_API_KEY       Required for API-backed runs" >&2
+        gum style --faint "  OPENAI_BASE_URL      API base URL (default: https://api.openai.com/v1)" >&2
+        gum style --faint "  APR_DEFAULT_MODEL    Default API model for new workflows" >&2
         gum style --faint "  APR_NO_GUM           Disable gum even if available" >&2
         gum style --faint "  NO_COLOR             Disable colored output" >&2
         echo "" >&2
@@ -6806,8 +6999,8 @@ show_help() {
         gum style --foreground 39 "  # Run with implementation doc" >&2
         echo "  apr run 2 --include-impl" >&2
         echo "" >&2
-        gum style --foreground 39 "  # First run with manual login" >&2
-        echo "  apr run 1 --login --wait" >&2
+        gum style --foreground 39 "  # Run and wait for API completion" >&2
+        echo "  apr run 1 --wait" >&2
         echo "" >&2
         gum style --foreground 39 "  # Compare round outputs" >&2
         echo "  apr diff 3 5" >&2
@@ -6826,7 +7019,7 @@ show_help() {
         gum style --faint "  0   Success" >&2
         gum style --faint "  1   Partial failure" >&2
         gum style --faint "  2   Usage error (bad arguments)" >&2
-        gum style --faint "  3   Dependency error (missing Oracle)" >&2
+        gum style --faint "  3   Dependency error (missing API key/curl/jq)" >&2
         gum style --faint "  4   Configuration error" >&2
         gum style --faint "  10  Network error" >&2
         gum style --faint "  11  Update error" >&2
@@ -6836,7 +7029,7 @@ show_help() {
     else
         echo -e "${BOLD}${YELLOW}DESCRIPTION${NC}" >&2
         echo "  Automated Plan Reviser Pro automates iterative specification" >&2
-        echo "  refinement using GPT Pro Extended Reasoning via Oracle." >&2
+        echo "  refinement using OpenAI Responses API background jobs." >&2
         echo "" >&2
         echo -e "${BOLD}${YELLOW}SYNOPSIS${NC}" >&2
         echo "  apr [command] [options]" >&2
@@ -6845,7 +7038,7 @@ show_help() {
         echo -e "  ${CYAN}Core Workflow${NC}" >&2
         echo -e "    ${GREEN}run <round>${NC}        Run a revision round" >&2
         echo -e "    ${GREEN}setup${NC}              Interactive workflow setup wizard" >&2
-        echo -e "    ${GREEN}status${NC}             Check Oracle session status" >&2
+        echo -e "    ${GREEN}status${NC}             Check API session status" >&2
         echo -e "    ${GREEN}attach <session>${NC}   Attach to running/completed session" >&2
         echo "" >&2
         echo -e "  ${CYAN}Management${NC}" >&2
@@ -6854,7 +7047,6 @@ show_help() {
         echo -e "    ${GREEN}show <round>${NC}       View round output" >&2
         echo -e "    ${GREEN}backfill${NC}           Generate metrics from existing rounds" >&2
         echo -e "    ${GREEN}update${NC}             Check for and install updates" >&2
-        echo -e "    ${GREEN}restore-oracle${NC}     Restore Oracle stability patch backup" >&2
         echo -e "    ${GREEN}help${NC}               Show this help message" >&2
         echo "" >&2
         echo -e "  ${CYAN}Analysis${NC}" >&2
@@ -6869,15 +7061,12 @@ show_help() {
         echo -e "${BOLD}${YELLOW}OPTIONS${NC}" >&2
         echo "  -w, --workflow NAME  Workflow to use (default: from config)" >&2
         echo "  -i, --include-impl   Include implementation document" >&2
-        echo "  -d, --dry-run        Preview without sending to GPT Pro" >&2
+        echo "  -d, --dry-run        Preview without creating an API job" >&2
         echo "  -r, --render         Render bundle for manual paste" >&2
         echo "  -c, --copy           Copy rendered bundle to clipboard" >&2
         echo "  -o, --output FILE    Output to file (integrate/export)" >&2
         echo "  --wait               Wait for completion (blocking)" >&2
-        echo "  --login              Manual login mode (first-time setup)" >&2
-        echo "  --keep-browser       Keep browser open after completion" >&2
         echo "  --no-preflight       Skip pre-flight validation checks" >&2
-        echo "  --retry/--no-retry   Enable/disable auto-retry (default: enabled)" >&2
         echo "  --hours NUM          Status window in hours (default: 72)" >&2
         echo "  --detailed           Show detailed metrics in stats" >&2
         echo "  --json               Output stats as raw JSON" >&2
@@ -6896,8 +7085,9 @@ show_help() {
         echo "  APR_CHECK_UPDATES    Enable daily update checking (set to 1)" >&2
         echo "  APR_STATUS_HOURS     Default status time window (default: 72)" >&2
         echo "  APR_VERBOSE          Enable verbose mode (set to true)" >&2
-        echo "  APR_MAX_RETRIES      Max retry attempts (default: 3)" >&2
-        echo "  APR_INITIAL_BACKOFF  Initial retry backoff in seconds (default: 10)" >&2
+        echo "  OPENAI_API_KEY       Required for API-backed runs" >&2
+        echo "  OPENAI_BASE_URL      API base URL (default: https://api.openai.com/v1)" >&2
+        echo "  APR_DEFAULT_MODEL    Default API model for new workflows" >&2
         echo "  APR_NO_GUM           Disable gum even if available" >&2
         echo "  NO_COLOR             Disable colored output" >&2
         echo "" >&2
@@ -6905,7 +7095,7 @@ show_help() {
         echo "  apr setup                    # First-time setup" >&2
         echo "  apr run 1                    # Run revision round 1" >&2
         echo "  apr run 2 --include-impl     # Include implementation doc" >&2
-        echo "  apr run 1 --login --wait     # First run with manual login" >&2
+        echo "  apr run 1 --wait             # Run and wait for API completion" >&2
         echo "  apr diff 3 5                 # Compare round outputs" >&2
         echo "  apr integrate 5 --copy       # Generate integration prompt" >&2
         echo "  apr status                   # Check session status" >&2
@@ -6915,7 +7105,7 @@ show_help() {
         echo "  0   Success" >&2
         echo "  1   Partial failure" >&2
         echo "  2   Usage error (bad arguments)" >&2
-        echo "  3   Dependency error (missing Oracle)" >&2
+        echo "  3   Dependency error (missing API key/curl/jq)" >&2
         echo "  4   Configuration error" >&2
         echo "  10  Network error" >&2
         echo "  11  Update error" >&2
@@ -6929,7 +7119,7 @@ show_help() {
 # -----------------------------------------------------------------------------
 
 main() {
-    # Handle --version and --help early (before gum/oracle checks)
+    # Handle --version and --help early (before other setup checks)
     if [[ "${1:-}" == "--version" || "${1:-}" == "-V" ]]; then
         echo "apr version $VERSION"
         exit $EXIT_SUCCESS
@@ -6955,7 +7145,7 @@ main() {
     # Check for updates (opt-in, non-blocking)
     check_for_updates
 
-    # Check Oracle availability (not needed for some commands)
+    # Resolve command before parsing options.
     local command="${1:-help}"
 
     # First-run experience: if no args and not configured, show welcome.
@@ -6990,10 +7180,7 @@ main() {
     RENDER=false
     COPY=false
     WAIT_MODE=false
-    MANUAL_LOGIN=false
-    KEEP_BROWSER=false
     SKIP_PREFLIGHT=false
-    ENABLE_RETRY=true
     INTEGRATE_OUTPUT=""
     STATUS_HOURS="${APR_STATUS_HOURS:-72}"
     STATS_DETAILED=false
@@ -7041,24 +7228,8 @@ main() {
                 WAIT_MODE=true
                 shift
                 ;;
-            --login)
-                MANUAL_LOGIN=true
-                shift
-                ;;
-            --keep-browser)
-                KEEP_BROWSER=true
-                shift
-                ;;
             --no-preflight)
                 SKIP_PREFLIGHT=true
-                shift
-                ;;
-            --retry)
-                ENABLE_RETRY=true
-                shift
-                ;;
-            --no-retry)
-                ENABLE_RETRY=false
                 shift
                 ;;
             -o|--output)
@@ -7159,43 +7330,6 @@ main() {
         WORKFLOW="default"
     fi
 
-    local command_is_round=false
-    if is_non_negative_int "$command"; then
-        command_is_round=true
-    fi
-
-    local oracle_required=false
-    if [[ "$command_is_round" == "true" || "$command" == "run" ]]; then
-        if [[ "$DRY_RUN" == "true" && "$RENDER" != "true" ]]; then
-            oracle_required=false
-        else
-            oracle_required=true
-        fi
-    elif [[ "$command" == "status" || "$command" == "attach" ]]; then
-        oracle_required=true
-    fi
-
-    if [[ "$oracle_required" == "true" ]]; then
-        if ! check_oracle; then
-            print_error "Oracle not found"
-            print_info "Install with: npm install -g @steipete/oracle"
-            if [[ -n "${APR_NO_NPX:-}" ]]; then
-                print_info "APR_NO_NPX is set; unset it to allow npx fallback"
-            else
-                print_info "Or ensure npx is available"
-            fi
-            exit $EXIT_DEPENDENCY_ERROR
-        fi
-    else
-        # Best-effort Oracle detection for dry-run output
-        if [[ "$command_is_round" == "true" || "$command" == "run" ]]; then
-            if ! check_oracle; then
-                ORACLE_CMD=("oracle")
-                [[ "$QUIET_MODE" != "true" ]] && print_warning "Oracle not found; dry run will use a placeholder command"
-            fi
-        fi
-    fi
-
     # Execute command
     case "$command" in
         run)
@@ -7289,9 +7423,6 @@ main() {
             ;;
         update)
             cmd_update
-            ;;
-        restore-oracle)
-            cmd_restore_oracle
             ;;
         help|--help|-h)
             show_help

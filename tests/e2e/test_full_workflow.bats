@@ -1,7 +1,7 @@
 #!/usr/bin/env bats
 # test_full_workflow.bats - End-to-end tests for complete APR workflows
 #
-# Tests complete user journeys without actual Oracle calls
+# Tests complete user journeys without actual OpenAI API calls
 
 # Load test helpers
 load '../helpers/test_helper'
@@ -15,7 +15,7 @@ setup() {
     log_test_start "${BATS_TEST_NAME}"
 
     cd "$TEST_PROJECT"
-    setup_mock_oracle
+    setup_mock_api
 }
 
 teardown() {
@@ -42,8 +42,9 @@ description: Default workflow
 documents:
   readme: README.md
   spec: SPEC.md
-oracle:
-  model: "5.2 Thinking"
+api:
+  model: "gpt-5.5"
+  reasoning_effort: high
 rounds:
   output_dir: .apr/rounds/default
 template: |
@@ -365,7 +366,7 @@ EOF
 # Integration with External Tools (Mocked)
 # =============================================================================
 
-@test "e2e: dry-run produces valid Oracle command" {
+@test "e2e: dry-run produces valid direct API request" {
     setup_test_workflow "default"
 
     run "$APR_SCRIPT" run 1 --dry-run
@@ -373,10 +374,10 @@ EOF
     log_test_output "$output"
 
     assert_success
-    # Should include Oracle command structure
-    [[ "$output" == *"oracle"* ]]
+    # Should include direct Responses API request structure
+    [[ "$output" == *"POST https://mock.openai.test/v1/responses"* ]]
     # Should include model selection
-    [[ "$output" == *"5.2"* ]] || [[ "$output" == *"model"* ]]
+    [[ "$output" == *"gpt-5.5"* ]] || [[ "$output" == *"model"* ]]
 }
 
 @test "e2e: render produces usable prompt" {

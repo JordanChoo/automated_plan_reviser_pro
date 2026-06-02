@@ -71,7 +71,7 @@ teardown() {
 }
 
 @test "apr robot validate: ok for valid workflow and round" {
-    setup_mock_oracle
+    setup_mock_api
     setup_test_workflow "robot"
 
     run "$APR_SCRIPT" robot validate 1 -w robot
@@ -101,7 +101,7 @@ teardown() {
 # =============================================================================
 
 @test "apr robot run: returns session JSON" {
-    setup_mock_oracle
+    setup_mock_api
     setup_test_workflow "robot"
 
     run "$APR_SCRIPT" robot run 1 -w robot
@@ -109,8 +109,7 @@ teardown() {
     log_test_output "$output"
 
     assert_success
-    # Extract JSON from output - the robot output is pretty-printed JSON
-    # Filter out non-JSON lines (Mock Oracle debug output goes to stderr but BATS captures both)
+    # Extract JSON from output - the robot output is pretty-printed JSON.
     local json_output
     # Use sed to extract from first { to matching } (the JSON block)
     json_output=$(echo "$output" | sed -n '/^{$/,/^}$/p')
@@ -125,12 +124,8 @@ teardown() {
 }
 
 @test "apr robot run: rejects concurrent run for same round" {
-    setup_mock_oracle
+    setup_mock_api
     setup_test_workflow "robot"
-
-    # Keep the mock Oracle process alive long enough that the second run
-    # deterministically overlaps (avoid flakiness on slow CI machines).
-    export MOCK_ORACLE_SLEEP=10
 
     capture_streams "$APR_SCRIPT" robot run 1 -w robot --compact
     log_test_actual "first stdout" "$CAPTURED_STDOUT"
@@ -390,7 +385,7 @@ teardown() {
     assert_success
     assert_valid_json "$output"
     assert_json_value "$output" ".ok" "true"
-    assert_json_value "$output" ".data.commands.status" "System overview (config, workflows, oracle)"
+    assert_json_value "$output" ".data.commands.status" "System overview (config, workflows, api)"
 }
 
 @test "apr robot help: includes new commands" {

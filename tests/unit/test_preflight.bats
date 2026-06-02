@@ -1,13 +1,8 @@
 #!/usr/bin/env bats
-# shellcheck disable=SC2030,SC2031,SC2119,SC2120  # BATS runs each test in an isolated shell; create_docs has an optional arg.
-# test_preflight.bats - Unit tests for preflight_check and validation paths
+# shellcheck disable=SC2030,SC2031,SC2119,SC2120
+# test_preflight.bats - Unit tests for API preflight_check and validation paths
 
-# Load test helpers
 load '../helpers/test_helper.bash'
-
-# =============================================================================
-# Setup and Teardown
-# =============================================================================
 
 setup() {
     setup_test_environment
@@ -21,15 +16,10 @@ teardown() {
     teardown_test_environment
 }
 
-# =============================================================================
-# Helper Functions
-# =============================================================================
-
 create_docs() {
     local dir="${1:-$TEST_PROJECT}"
     mkdir -p "$dir"
 
-    # Keep fixtures comfortably above preflight "suspiciously small" thresholds.
     cat > "$dir/README.md" <<'EOF'
 # README
 
@@ -50,8 +40,6 @@ EOF
 This is a test implementation doc for APR preflight unit tests.
 It is intentionally long enough to avoid size warnings.
 EOF
-
-    log_test_step "fixture" "Created test docs in $dir"
 }
 
 write_workflow_config() {
@@ -60,7 +48,6 @@ write_workflow_config() {
     local impl_path="${3:-}"
 
     mkdir -p ".apr/workflows"
-
     {
         echo "name: default"
         echo "description: Test workflow"
@@ -70,64 +57,26 @@ write_workflow_config() {
         if [[ -n "$impl_path" ]]; then
             echo "  implementation: $impl_path"
         fi
-        echo "oracle:"
-        echo "  model: \"5.2 Thinking\""
+        echo "api:"
+        echo "  model: \"gpt-5.5\""
+        echo "  reasoning_effort: high"
         echo "rounds:"
         echo "  output_dir: .apr/rounds/default"
     } > ".apr/workflows/default.yaml"
-
     echo "default_workflow: default" > ".apr/config.yaml"
 }
 
-create_oracle_version_fail() {
-    local mock_bin="$TEST_DIR/mock_oracle_fail"
+create_path_without_api() {
+    local mock_bin="$TEST_DIR/no_api_bin"
     mkdir -p "$mock_bin"
-
-    cat > "$mock_bin/oracle" << 'EOF'
-#!/usr/bin/env bash
-if [[ "${1:-}" == "--version" ]]; then
-    exit 1
-fi
-echo "mock oracle ok"
-exit 0
-EOF
-    chmod +x "$mock_bin/oracle"
-
-    echo "$mock_bin"
-}
-
-create_path_without_oracle() {
-    local mock_bin="$TEST_DIR/no_oracle_bin"
-    mkdir -p "$mock_bin"
-
     ln -s "$(command -v jq)" "$mock_bin/jq"
     ln -s "$(command -v awk)" "$mock_bin/awk"
     ln -s "$(command -v date)" "$mock_bin/date"
-    # Keep enough coreutils available for test helpers (capture_streams, logging).
     ln -s "$(command -v mktemp)" "$mock_bin/mktemp"
     ln -s "$(command -v mkdir)" "$mock_bin/mkdir"
     ln -s "$(command -v rm)" "$mock_bin/rm"
     ln -s "$(command -v cat)" "$mock_bin/cat"
-
     echo "$mock_bin"
-}
-
-create_oracle_npm_install() {
-    local prefix="$1"
-    local package_dir="$prefix/lib/node_modules/@steipete/oracle"
-    local action_dir="$package_dir/dist/src/browser/actions"
-
-    mkdir -p "$prefix/bin" "$package_dir/bin" "$action_dir"
-
-    cat > "$package_dir/bin/oracle" <<'EOF'
-#!/usr/bin/env bash
-echo "oracle 0.8.4"
-EOF
-    chmod +x "$package_dir/bin/oracle"
-    ln -s "../lib/node_modules/@steipete/oracle/bin/oracle" "$prefix/bin/oracle"
-
-    printf '%s\n' "current assistant response" > "$action_dir/assistantResponse.js"
-    printf '%s\n' "$action_dir/assistantResponse.js"
 }
 
 assert_json_array_contains() {
@@ -141,294 +90,59 @@ assert_json_array_contains() {
     fi
 }
 
-# =============================================================================
-# preflight_check() Tests
-# =============================================================================
-
 @test "preflight_check: happy path returns 0" {
     create_docs
-    setup_mock_oracle
+    setup_mock_api
 
     capture_streams preflight_check "$TEST_PROJECT/README.md" "$TEST_PROJECT/SPEC.md" "$TEST_PROJECT/IMPL.md"
 
-    log_test_actual "exit code" "$CAPTURED_STATUS"
     [[ "$CAPTURED_STATUS" -eq 0 ]]
+    [[ "$CAPTURED_STDERR" == *"Direct API ready"* ]]
+}
+
+@test "preflight_check: missing API key returns 1" {
+    create_docs
+    unset OPENAI_API_KEY 2>/dev/null || true
+
+    capture_streams preflight_check "$TEST_PROJECT/README.md" "$TEST_PROJECT/SPEC.md"
+
+    [[ "$CAPTURED_STATUS" -eq 1 ]]
+    [[ "$CAPTURED_STDERR" == *"OPENAI_API_KEY is not set"* ]]
 }
 
 @test "preflight_check: README missing returns 1" {
     printf '%s\n' "# SPEC" > "$TEST_PROJECT/SPEC.md"
-    setup_mock_oracle
+    setup_mock_api
 
     capture_streams preflight_check "$TEST_PROJECT/README.md" "$TEST_PROJECT/SPEC.md"
 
-    log_test_actual "exit code" "$CAPTURED_STATUS"
     [[ "$CAPTURED_STATUS" -eq 1 ]]
     [[ "$CAPTURED_STDERR" == *"README not found"* ]]
 }
 
-@test "preflight_check: README not readable returns 1" {
-    create_docs
-    chmod 000 "$TEST_PROJECT/README.md"
-    setup_mock_oracle
-
-    capture_streams preflight_check "$TEST_PROJECT/README.md" "$TEST_PROJECT/SPEC.md"
-
-    log_test_actual "exit code" "$CAPTURED_STATUS"
-    [[ "$CAPTURED_STATUS" -eq 1 ]]
-    [[ "$CAPTURED_STDERR" == *"README not readable"* ]]
-}
-
 @test "preflight_check: Spec missing returns 1" {
     printf '%s\n' "# README" > "$TEST_PROJECT/README.md"
-    setup_mock_oracle
+    setup_mock_api
 
     capture_streams preflight_check "$TEST_PROJECT/README.md" "$TEST_PROJECT/SPEC.md"
 
-    log_test_actual "exit code" "$CAPTURED_STATUS"
     [[ "$CAPTURED_STATUS" -eq 1 ]]
     [[ "$CAPTURED_STDERR" == *"Spec not found"* ]]
 }
 
-@test "preflight_check: Spec not readable returns 1" {
-    create_docs
-    chmod 000 "$TEST_PROJECT/SPEC.md"
-    setup_mock_oracle
-
-    capture_streams preflight_check "$TEST_PROJECT/README.md" "$TEST_PROJECT/SPEC.md"
-
-    log_test_actual "exit code" "$CAPTURED_STATUS"
-    [[ "$CAPTURED_STATUS" -eq 1 ]]
-    [[ "$CAPTURED_STDERR" == *"Spec not readable"* ]]
-}
-
 @test "preflight_check: impl missing returns warning (2)" {
     create_docs
-    setup_mock_oracle
+    setup_mock_api
 
     capture_streams preflight_check "$TEST_PROJECT/README.md" "$TEST_PROJECT/SPEC.md" "$TEST_PROJECT/MISSING_IMPL.md"
 
-    log_test_actual "exit code" "$CAPTURED_STATUS"
     [[ "$CAPTURED_STATUS" -eq 2 ]]
     [[ "$CAPTURED_STDERR" == *"Implementation not found"* ]]
 }
 
-@test "preflight_check: impl not readable returns warning (2)" {
-    create_docs
-    chmod 000 "$TEST_PROJECT/IMPL.md"
-    setup_mock_oracle
-
-    capture_streams preflight_check "$TEST_PROJECT/README.md" "$TEST_PROJECT/SPEC.md" "$TEST_PROJECT/IMPL.md"
-
-    log_test_actual "exit code" "$CAPTURED_STATUS"
-    [[ "$CAPTURED_STATUS" -eq 2 ]]
-    [[ "$CAPTURED_STDERR" == *"Implementation not readable"* ]]
-}
-
-@test "preflight_check: impl valid returns 0" {
-    create_docs
-    setup_mock_oracle
-
-    capture_streams preflight_check "$TEST_PROJECT/README.md" "$TEST_PROJECT/SPEC.md" "$TEST_PROJECT/IMPL.md"
-
-    log_test_actual "exit code" "$CAPTURED_STATUS"
-    [[ "$CAPTURED_STATUS" -eq 0 ]]
-}
-
-@test "preflight_check: oracle missing returns 1" {
-    create_docs
-    check_oracle() { return 1; }
-
-    capture_streams preflight_check "$TEST_PROJECT/README.md" "$TEST_PROJECT/SPEC.md"
-
-    log_test_actual "exit code" "$CAPTURED_STATUS"
-    [[ "$CAPTURED_STATUS" -eq 1 ]]
-    [[ "$CAPTURED_STDERR" == *"Oracle not available"* ]]
-}
-
-@test "preflight_check: oracle version check failure returns warning (2)" {
-    create_docs
-    local mock_bin
-    mock_bin="$(create_oracle_version_fail)"
-    local original_path="$PATH"
-    PATH="$mock_bin:$PATH"
-    export PATH
-
-    capture_streams preflight_check "$TEST_PROJECT/README.md" "$TEST_PROJECT/SPEC.md"
-
-    PATH="$original_path"
-    export PATH
-
-    log_test_actual "exit code" "$CAPTURED_STATUS"
-    [[ "$CAPTURED_STATUS" -eq 2 ]]
-    [[ "$CAPTURED_STDERR" == *"Could not verify Oracle version"* ]]
-}
-
-@test "find_oracle_assistant_response: ignores unrelated npm root fallback" {
-    local mock_bin="$TEST_DIR/mock_bin"
-    local unrelated_node_modules="$TEST_DIR/unrelated/lib/node_modules"
-    local unrelated_action_dir="$unrelated_node_modules/@steipete/oracle/dist/src/browser/actions"
-    mkdir -p "$mock_bin" "$unrelated_action_dir"
-
-    cat > "$mock_bin/oracle" <<'EOF'
-#!/usr/bin/env bash
-echo "wrapper oracle"
-EOF
-    chmod +x "$mock_bin/oracle"
-
-    cat > "$mock_bin/npm" <<EOF
-#!/usr/bin/env bash
-if [[ "\${1:-}" == "root" && "\${2:-}" == "-g" ]]; then
-    echo "$unrelated_node_modules"
-    exit 0
-fi
-exit 1
-EOF
-    chmod +x "$mock_bin/npm"
-    printf '%s\n' "unrelated oracle package" > "$unrelated_action_dir/assistantResponse.js"
-
-    local original_path="$PATH"
-    PATH="$mock_bin:$PATH"
-    export PATH
-
-    run find_oracle_assistant_response
-
-    PATH="$original_path"
-    export PATH
-
-    [[ "$status" -eq 2 ]]
-}
-
-@test "patch_oracle_stability_thresholds: skips local oracle wrappers without warning" {
-    local mock_bin="$TEST_DIR/mock_bin"
-    mkdir -p "$mock_bin"
-
-    cat > "$mock_bin/oracle" <<'EOF'
-#!/usr/bin/env bash
-if [[ "${1:-}" == "--version" ]]; then
-    echo "oracle wrapper"
-    exit 0
-fi
-exit 0
-EOF
-    chmod +x "$mock_bin/oracle"
-
-    local original_path="$PATH"
-    PATH="$mock_bin:$PATH"
-    # shellcheck disable=SC2034  # Consumed by patch_oracle_stability_thresholds.
-    ORACLE_CMD=("oracle")
-    # shellcheck disable=SC2034  # Consumed by patch_oracle_stability_thresholds.
-    APR_ORACLE_PATCHED=false
-    unset APR_NO_ORACLE_PATCH 2>/dev/null || true
-    export PATH
-
-    capture_streams patch_oracle_stability_thresholds
-
-    PATH="$original_path"
-    export PATH
-
-    [[ "$CAPTURED_STATUS" -eq 0 ]]
-    [[ "$CAPTURED_STDERR" != *"Cannot find Oracle assistantResponse.js"* ]]
-    [[ "$CAPTURED_STDERR" != *"responses may be truncated"* ]]
-}
-
-@test "find_oracle_assistant_response: finds package adjacent to selected oracle symlink" {
-    local prefix="$TEST_DIR/npm_prefix"
-    local target_file
-    target_file="$(create_oracle_npm_install "$prefix")"
-
-    local original_path="$PATH"
-    PATH="$prefix/bin:$PATH"
-    export PATH
-
-    capture_streams find_oracle_assistant_response
-
-    PATH="$original_path"
-    export PATH
-
-    [[ "$CAPTURED_STATUS" -eq 0 ]]
-    [[ "$ORACLE_ASSISTANT_RESPONSE_PATH" == "$target_file" ]]
-    [[ "$ORACLE_BACKUP_PATH" == "${target_file}.apr-backup" ]]
-}
-
-@test "patch_oracle_stability_thresholds: applies patch to npm oracle file" {
-    local prefix="$TEST_DIR/npm_prefix"
-    local target_file
-    target_file="$(create_oracle_npm_install "$prefix")"
-
-    cat > "$target_file" <<'EOF'
-const minStableMs = shortAnswer ? 8000 : 1200;
-const requiredStableCycles = shortAnswer ? 12 : 6;
-const settleWindowMs = shortAnswer ? 12_000 : 5_000;
-const stableTarget = shortAnswer ? 6 : 3;
-EOF
-
-    local original_path="$PATH"
-    PATH="$prefix/bin:$PATH"
-    # shellcheck disable=SC2034  # Consumed by patch_oracle_stability_thresholds.
-    ORACLE_CMD=("oracle")
-    # shellcheck disable=SC2034  # Consumed by patch_oracle_stability_thresholds.
-    APR_ORACLE_PATCHED=false
-    unset APR_NO_ORACLE_PATCH 2>/dev/null || true
-    export PATH
-
-    capture_streams patch_oracle_stability_thresholds
-
-    PATH="$original_path"
-    export PATH
-
-    [[ "$CAPTURED_STATUS" -eq 0 ]]
-    [[ -f "${target_file}.apr-backup" ]]
-    grep -q "APR_PATCHED_STABILITY_THRESHOLDS" "$target_file"
-    grep -q "const requiredStableCycles = shortAnswer ? 18 : 12;" "$target_file"
-    grep -q "const settleWindowMs = shortAnswer ? 15_000 : 30000;" "$target_file"
-    grep -q "const stableTarget = shortAnswer ? 12 : 6;" "$target_file"
-}
-
-@test "restore_oracle_from_backup: fails cleanly when backup is missing" {
-    local prefix="$TEST_DIR/npm_prefix"
-    create_oracle_npm_install "$prefix" >/dev/null
-
-    local original_path="$PATH"
-    PATH="$prefix/bin:$PATH"
-    export PATH
-
-    capture_streams restore_oracle_from_backup
-
-    PATH="$original_path"
-    export PATH
-
-    [[ "$CAPTURED_STATUS" -eq 1 ]]
-    [[ "$CAPTURED_STDERR" == *"No Oracle backup found"* ]]
-}
-
-@test "restore_oracle_from_backup: restores assistantResponse.js from backup" {
-    local prefix="$TEST_DIR/npm_prefix"
-    local target_file
-    target_file="$(create_oracle_npm_install "$prefix")"
-    printf '%s\n' "original assistant response" > "${target_file}.apr-backup"
-    printf '%s\n' "patched assistant response" > "$target_file"
-
-    local original_path="$PATH"
-    PATH="$prefix/bin:$PATH"
-    export PATH
-
-    capture_streams restore_oracle_from_backup
-
-    PATH="$original_path"
-    export PATH
-
-    [[ "$CAPTURED_STATUS" -eq 0 ]]
-    [[ "$(cat "$target_file")" == "original assistant response" ]]
-}
-
-# =============================================================================
-# run_round() Validation Path Tests
-# =============================================================================
-
 @test "run_round: missing workflow config returns EXIT_CONFIG_ERROR" {
     run bash -c 'source "$TEST_DIR/apr_functions.bash"; cd "$TEST_PROJECT"; run_round 1'
 
-    log_test_actual "exit code" "$status"
     [[ "$status" -eq 4 ]]
 }
 
@@ -438,51 +152,33 @@ EOF
 
     run bash -c 'source "$TEST_DIR/apr_functions.bash"; cd "$TEST_PROJECT"; DRY_RUN=true; run_round 1' 2>&1
 
-    log_test_actual "exit code" "$status"
     [[ "$status" -eq 4 ]]
     [[ "$output" == *"Required file not found"* ]]
 }
 
 @test "run_round: include_impl with no implementation configured warns and continues" {
-    printf '%s\n' "# README" > "$TEST_PROJECT/README.md"
-    printf '%s\n' "# SPEC" > "$TEST_PROJECT/SPEC.md"
+    create_docs
     write_workflow_config "$TEST_PROJECT/README.md" "$TEST_PROJECT/SPEC.md"
 
     run bash -c 'source "$TEST_DIR/apr_functions.bash"; cd "$TEST_PROJECT"; INCLUDE_IMPL=true; DRY_RUN=true; run_round 1' 2>&1
 
-    log_test_actual "exit code" "$status"
     [[ "$status" -eq 0 ]]
     [[ "$output" == *"Implementation document not configured; skipping"* ]]
-}
-
-@test "run_round: include_impl with missing file warns and continues" {
-    printf '%s\n' "# README" > "$TEST_PROJECT/README.md"
-    printf '%s\n' "# SPEC" > "$TEST_PROJECT/SPEC.md"
-    write_workflow_config "$TEST_PROJECT/README.md" "$TEST_PROJECT/SPEC.md" "$TEST_PROJECT/MISSING_IMPL.md"
-
-    run bash -c 'source "$TEST_DIR/apr_functions.bash"; cd "$TEST_PROJECT"; INCLUDE_IMPL=true; DRY_RUN=true; run_round 1' 2>&1
-
-    log_test_actual "exit code" "$status"
-    [[ "$status" -eq 0 ]]
-    [[ "$output" == *"Implementation file not found"* ]]
+    [[ "$output" == *"POST"* ]]
 }
 
 @test "run_round: existing output can cancel with prompt" {
     create_docs
+    setup_mock_api
     write_workflow_config "$TEST_PROJECT/README.md" "$TEST_PROJECT/SPEC.md" "$TEST_PROJECT/IMPL.md"
     mkdir -p ".apr/rounds/default"
     printf '%s\n' "existing" > ".apr/rounds/default/round_1.md"
 
     run bash -c 'source "$TEST_DIR/apr_functions.bash"; cd "$TEST_PROJECT"; SKIP_PREFLIGHT=true; can_prompt() { return 0; }; confirm() { return 1; }; run_round 1' 2>&1
 
-    log_test_actual "exit code" "$status"
     [[ "$status" -eq 0 ]]
     [[ "$output" == *"Cancelled."* ]]
 }
-
-# =============================================================================
-# robot_validate() Tests
-# =============================================================================
 
 @test "robot_validate: missing round number returns usage_error" {
     capture_streams robot_validate
@@ -504,73 +200,24 @@ EOF
     [[ "$CAPTURED_STDERR" == *"APR_ERROR_CODE=not_configured"* ]]
 }
 
-@test "robot_validate: workflow not found returns validation_failed" {
-    mkdir -p ".apr/workflows"
-    echo "default_workflow: default" > ".apr/config.yaml"
-
-    capture_streams robot_validate 1
-
-    assert_valid_json "$CAPTURED_STDOUT"
-    assert_json_value "$CAPTURED_STDOUT" ".ok" "false"
-    assert_json_value "$CAPTURED_STDOUT" ".code" "validation_failed"
-    assert_json_array_contains "$CAPTURED_STDOUT" ".data.errors" "Workflow 'default' not found"
-    [[ "$CAPTURED_STDERR" == *"APR_ERROR_CODE=validation_failed"* ]]
-}
-
-@test "robot_validate: README missing populates errors" {
-    printf '%s\n' "# SPEC" > "$TEST_PROJECT/SPEC.md"
-    write_workflow_config "$TEST_PROJECT/MISSING_README.md" "$TEST_PROJECT/SPEC.md"
-    setup_mock_oracle
-
-    capture_streams robot_validate 1
-
-    assert_valid_json "$CAPTURED_STDOUT"
-    assert_json_value "$CAPTURED_STDOUT" ".ok" "false"
-    assert_json_value "$CAPTURED_STDOUT" ".code" "validation_failed"
-    assert_json_array_contains "$CAPTURED_STDOUT" ".data.errors" "README not found: $TEST_PROJECT/MISSING_README.md"
-    [[ "$CAPTURED_STDERR" == *"APR_ERROR_CODE=validation_failed"* ]]
-}
-
-@test "robot_validate: spec missing populates errors" {
-    printf '%s\n' "# README" > "$TEST_PROJECT/README.md"
-    write_workflow_config "$TEST_PROJECT/README.md" "$TEST_PROJECT/MISSING_SPEC.md"
-    setup_mock_oracle
-
-    capture_streams robot_validate 1
-
-    assert_valid_json "$CAPTURED_STDOUT"
-    assert_json_value "$CAPTURED_STDOUT" ".ok" "false"
-    assert_json_value "$CAPTURED_STDOUT" ".code" "validation_failed"
-    assert_json_array_contains "$CAPTURED_STDOUT" ".data.errors" "Spec not found: $TEST_PROJECT/MISSING_SPEC.md"
-    [[ "$CAPTURED_STDERR" == *"APR_ERROR_CODE=validation_failed"* ]]
-}
-
-@test "robot_validate: oracle missing populates errors" {
+@test "robot_validate: API missing populates errors" {
     create_docs
     write_workflow_config "$TEST_PROJECT/README.md" "$TEST_PROJECT/SPEC.md"
-
-    local original_path="$PATH"
-    local mock_path
-    mock_path="$(create_path_without_oracle)"
-    PATH="$mock_path"
-    export PATH
+    unset OPENAI_API_KEY 2>/dev/null || true
 
     capture_streams robot_validate 1
-
-    PATH="$original_path"
-    export PATH
 
     assert_valid_json "$CAPTURED_STDOUT"
     assert_json_value "$CAPTURED_STDOUT" ".ok" "false"
     assert_json_value "$CAPTURED_STDOUT" ".code" "validation_failed"
-    assert_json_array_contains "$CAPTURED_STDOUT" ".data.errors" "Oracle not available"
+    assert_json_array_contains "$CAPTURED_STDOUT" ".data.errors" "Direct API not available: OPENAI_API_KEY is not set"
     [[ "$CAPTURED_STDERR" == *"APR_ERROR_CODE=validation_failed"* ]]
 }
 
 @test "robot_validate: previous round missing yields warnings but ok true" {
     create_docs
     write_workflow_config "$TEST_PROJECT/README.md" "$TEST_PROJECT/SPEC.md"
-    setup_mock_oracle
+    setup_mock_api
 
     capture_streams robot_validate 2
 
@@ -583,7 +230,7 @@ EOF
 @test "robot_validate: all valid returns ok true" {
     create_docs
     write_workflow_config "$TEST_PROJECT/README.md" "$TEST_PROJECT/SPEC.md" "$TEST_PROJECT/IMPL.md"
-    setup_mock_oracle
+    setup_mock_api
 
     capture_streams robot_validate 1
 

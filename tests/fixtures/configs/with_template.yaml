@@ -6,25 +6,17 @@ documents:
   spec: SPECIFICATION.md
   implementation: IMPLEMENTATION.md
 
-oracle:
-  model: "5.2 Thinking"
-  thinking_time: heavy
+api:
+  model: "gpt-5.5"
+  reasoning_effort: high
 
 rounds:
   output_dir: .apr/rounds/template
 
 template: |
-  First, read this README:
+  First, read the README section in the APR review bundle.
 
-  <readme>
-  {{README}}
-  </readme>
-
-  Now read the specification:
-
-  <spec>
-  {{SPEC}}
-  </spec>
+  Now read the specification section in the APR review bundle.
 
   Please analyze and provide feedback on this specification.
   Focus on:
@@ -33,23 +25,11 @@ template: |
   3. Technical feasibility
 
 template_with_impl: |
-  First, read this README:
+  First, read the README section in the APR review bundle.
 
-  <readme>
-  {{README}}
-  </readme>
+  Now read the specification section in the APR review bundle.
 
-  Now read the specification:
-
-  <spec>
-  {{SPEC}}
-  </spec>
-
-  And the current implementation:
-
-  <implementation>
-  {{IMPL}}
-  </implementation>
+  And read the current implementation section in the APR review bundle.
 
   Please analyze the implementation against the specification.
   Focus on:

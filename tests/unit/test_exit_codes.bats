@@ -22,7 +22,7 @@ load '../helpers/test_helper.bash'
     run "$APR_SCRIPT" help
     assert_exit_code 0
     [[ "$output" == *"COMMANDS"* ]]
-    [[ "$output" == *"restore-oracle"* ]]
+    [[ "$output" == *"Responses API"* ]]
     [[ "$output" != *"WELCOME TO APR"* ]]
 }
 
@@ -151,17 +151,15 @@ load '../helpers/test_helper.bash'
 # EXIT_DEPENDENCY_ERROR (3) - Missing Dependencies
 # =============================================================================
 
-@test "apr run without Oracle shows dependency error" {
+@test "apr run without API key shows dependency error" {
     cd "$TEST_PROJECT"
     setup_test_workflow
 
-    # Hide oracle/npx from the script. Some environments include npx in /usr/bin,
-    # which would otherwise trigger the npx fallback and attempt a real run.
-    run env PATH="/usr/bin:/bin" APR_NO_NPX=1 "$APR_SCRIPT" run 1
+    unset OPENAI_API_KEY 2>/dev/null || true
+    run "$APR_SCRIPT" run 1
 
-    # Should fail due to missing Oracle
-    # Exit code 3 (dependency) or include error message about Oracle
-    [[ $status -eq 3 ]] || [[ "$output" =~ [Oo]racle ]]
+    [[ $status -eq 4 ]] || [[ $status -eq 3 ]]
+    [[ "$output" == *"OPENAI_API_KEY is not set"* ]]
 }
 
 # =============================================================================

@@ -194,9 +194,9 @@ documents:
   spec: SPECIFICATION.md
   implementation: IMPLEMENTATION.md
 
-oracle:
-  model: "5.2 Thinking"
-  thinking_time: heavy
+api:
+  model: "gpt-5.5"
+  reasoning_effort: high
 
 rounds:
   output_dir: .apr/rounds/$workflow
@@ -316,78 +316,115 @@ capture_streams() {
 }
 
 # =============================================================================
-# Mock Oracle (for tests that don't need real Oracle)
+# Mock Responses API (for tests that do not call the real API)
 # =============================================================================
 
-# setup_mock_oracle - Create a mock oracle command for testing
-setup_mock_oracle() {
-    local mock_oracle="$TEST_DIR/bin/oracle"
-    mkdir -p "$(dirname "$mock_oracle")"
-    export APR_NO_ORACLE_PATCH=1
+# setup_mock_api - Create a mock curl command for API-backed tests
+setup_mock_api() {
+    local mock_curl="$TEST_DIR/bin/curl"
+    mkdir -p "$(dirname "$mock_curl")"
+    export OPENAI_API_KEY="test-openai-key"
+    export OPENAI_BASE_URL="https://mock.openai.test/v1"
+    export APR_API_POLL_INTERVAL="${APR_API_POLL_INTERVAL:-1}"
+    export APR_API_MAX_POLL_SECONDS="${APR_API_MAX_POLL_SECONDS:-5}"
 
-    cat > "$mock_oracle" << 'EOF'
+    cat > "$mock_curl" << 'EOF'
 #!/usr/bin/env bash
-# Mock Oracle for APR testing
-# All debug output goes to stderr to avoid interfering with JSON responses
-echo "Mock Oracle called with: $*" >&2
+# Mock curl for APR Responses API testing.
+method="GET"
+url=""
+write_status=false
+data_arg=""
 
-# Parse arguments for --render flag
-render_mode=false
-for arg in "$@"; do
-    case "$arg" in
-        --render) render_mode=true ;;
-        --version) echo "oracle 0.8.4 (mock)"; exit 0 ;;
-        --help)
-            echo "Usage: oracle [options]"
-            echo "  --notify"
-            exit 0
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -X)
+            method="${2:-GET}"
+            shift 2
+            ;;
+        -w)
+            write_status=true
+            shift 2
+            ;;
+        --data-binary)
+            data_arg="${2:-}"
+            shift 2
+            ;;
+        -H|--connect-timeout|--max-time)
+            shift 2
+            ;;
+        http://*|https://*)
+            url="$1"
+            shift
+            ;;
+        *)
+            shift
             ;;
     esac
 done
 
-case "$1" in
-    status)
-        echo "No active sessions" >&2
-        ;;
-    session)
-        echo "Session: $2" >&2
-        ;;
-    *)
-        if [[ "$render_mode" == "true" ]]; then
-            # Render mode: output bundle content to stdout (required for --render tests)
-            echo "🧿 oracle 0.8.4 — Mock Oracle"
-            echo "[SYSTEM]"
-            echo "Mock Oracle render output"
-            echo ""
-            echo "[USER]"
-            echo "Mock prompt content for testing"
-        else
-            # Simulate a long-running request - output to stderr only
-            echo "Mock response for: $*" >&2
-            sleep "${MOCK_ORACLE_SLEEP:-1}"
-        fi
-        ;;
-esac
-exit 0
+payload=""
+if [[ "$method" == "POST" ]]; then
+    if [[ "$data_arg" == "@-" ]]; then
+        payload=$(cat)
+    elif [[ -n "$data_arg" ]]; then
+        payload="$data_arg"
+    fi
+fi
+
+mock_output_text() {
+    local id="$1"
+    {
+        printf 'Mock API review output for %s.\n\n' "$id"
+        for i in $(seq 1 80); do
+            printf 'Recommendation %02d: tighten the specification, validate assumptions, and keep the implementation aligned with the plan.\n' "$i"
+        done
+        printf '\nComplete.\n'
+    }
+}
+
+http_code="${MOCK_API_HTTP_CODE:-200}"
+if [[ ! "$http_code" =~ ^2 ]]; then
+    body=$(jq -nc --arg msg "${MOCK_API_ERROR:-mock api error}" '{error:{message:$msg}}')
+elif [[ "$method" == "POST" ]]; then
+    slug=$(printf '%s' "$payload" | jq -r '.metadata.apr_slug // "apr-mock-round-1"' 2>/dev/null || echo "apr-mock-round-1")
+    response_id="resp_mock_${slug//[^A-Za-z0-9_]/_}"
+    status="${MOCK_API_CREATE_STATUS:-in_progress}"
+    if [[ "$status" == "completed" ]]; then
+        text=$(mock_output_text "$response_id")
+        body=$(jq -nc --arg id "$response_id" --arg status "$status" --arg text "$text" \
+            '{id:$id, object:"response", status:$status, output_text:$text, output:[{type:"message", content:[{type:"output_text", text:$text}]}]}')
+    else
+        body=$(jq -nc --arg id "$response_id" --arg status "$status" '{id:$id, object:"response", status:$status}')
+    fi
+else
+    response_id="${url##*/}"
+    status="${MOCK_API_GET_STATUS:-completed}"
+    if [[ "$status" == "completed" ]]; then
+        text=$(mock_output_text "$response_id")
+        body=$(jq -nc --arg id "$response_id" --arg status "$status" --arg text "$text" \
+            '{id:$id, object:"response", status:$status, output_text:$text, output:[{type:"message", content:[{type:"output_text", text:$text}]}]}')
+    else
+        body=$(jq -nc --arg id "$response_id" --arg status "$status" '{id:$id, object:"response", status:$status}')
+    fi
+fi
+
+printf '%s' "$body"
+if [[ "$write_status" == "true" ]]; then
+    printf '\n%s' "$http_code"
+fi
 EOF
-    chmod +x "$mock_oracle"
+    chmod +x "$mock_curl"
 
     # Add to PATH
     export PATH="$TEST_DIR/bin:$PATH"
 
-    log_test_step "mock" "Created mock oracle at $mock_oracle"
+    log_test_step "mock" "Created mock API curl at $mock_curl"
 }
 
 # =============================================================================
 # Utility Functions
 # =============================================================================
-
-# skip_if_no_oracle - Skip test if real Oracle is required but not available
-skip_if_no_oracle() {
-    if ! command -v oracle &>/dev/null; then
-        skip "Oracle not available"
-    fi
-}
 
 # skip_if_no_gum - Skip test if gum is required but not available
 skip_if_no_gum() {

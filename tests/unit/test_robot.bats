@@ -159,7 +159,7 @@ teardown() {
     ROBOT_COMPACT=true
     cd "$TEST_PROJECT" || return 1
 
-    setup_mock_oracle
+    setup_mock_api
     setup_test_workflow "alpha"
     WORKFLOW="alpha"
 
@@ -215,7 +215,7 @@ teardown() {
 
     assert_success
     assert_robot_success "$output"
-    assert_json_value "$output" ".data.commands.status" "System overview (config, workflows, oracle)"
+    assert_json_value "$output" ".data.commands.status" "System overview (config, workflows, api)"
     assert_json_value "$output" ".data.options[\"-w, --workflow NAME\"]" "Workflow name (default: from config)"
     assert_json_value "$output" ".data.options[\"-f, --format FORMAT\"]" "Robot output format: json or toon (env: APR_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT)"
     assert_json_value "$output" ".data.options[\"--stats\"]" "Show token savings statistics (JSON vs TOON byte comparison)"
@@ -260,7 +260,7 @@ teardown() {
     ROBOT_COMPACT=true
     cd "$TEST_PROJECT" || return 1
 
-    setup_mock_oracle
+    setup_mock_api
     setup_test_workflow "gamma"
     WORKFLOW="gamma"
 
@@ -319,11 +319,11 @@ teardown() {
     [[ "$CAPTURED_STDERR" == *"APR_ERROR_CODE=usage_error"* ]]
 }
 
-@test "robot_run: starts oracle process in background" {
+@test "robot_run: creates API response in background" {
     ROBOT_COMPACT=true
     cd "$TEST_PROJECT" || return 1
 
-    setup_mock_oracle
+    setup_mock_api
     setup_test_workflow "delta"
     WORKFLOW="delta"
 
@@ -331,9 +331,8 @@ teardown() {
 
     assert_success
     assert_robot_success "$output"
-    assert_json_value "$output" ".data.status" "running"
-    # PID should be an integer
-    echo "$output" | jq -e '.data.pid | type == "number"' > /dev/null
+    assert_json_value "$output" ".data.status" "in_progress"
+    echo "$output" | jq -e '.data.response_id | startswith("resp_mock_")' > /dev/null
 }
 
 # =============================================================================

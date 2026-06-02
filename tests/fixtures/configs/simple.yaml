@@ -5,9 +5,9 @@ documents:
   readme: README.md
   spec: SPECIFICATION.md
 
-oracle:
-  model: "5.2 Thinking"
-  thinking_time: heavy
+api:
+  model: "gpt-5.5"
+  reasoning_effort: high
 
 rounds:
   output_dir: .apr/rounds/simple
