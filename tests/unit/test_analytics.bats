@@ -47,6 +47,14 @@ create_path_without_flock() {
     printf '%s\n' "$bin_dir"
 }
 
+setup_backfill_fixture() {
+    local workflow="$1"
+
+    mkdir -p "$CONFIG_DIR/workflows" "$CONFIG_DIR/rounds/$workflow"
+    printf 'name: %s\n' "$workflow" > "$CONFIG_DIR/workflows/${workflow}.yaml"
+    printf '# Round 1\n\nGenerated feedback.\n' > "$CONFIG_DIR/rounds/$workflow/round_1.md"
+}
+
 # =============================================================================
 # Metrics Storage: Path Functions
 # =============================================================================
@@ -725,6 +733,37 @@ OUTER
     # Should have convergence data
     [[ "$convergence" != "null" ]]
     echo "$convergence" | jq -e '.confidence' >/dev/null
+}
+
+# =============================================================================
+# Backfill Failure Propagation
+# =============================================================================
+
+@test "backfill_workflow: fails when a round metrics write fails" {
+    setup_backfill_fixture "backfill-write-failure-test"
+    # shellcheck disable=SC2317  # Test stub is invoked indirectly by backfill_workflow.
+    metrics_write_round() { return 1; }
+
+    run backfill_workflow "backfill-write-failure-test" false false
+
+    log_test_actual "exit code" "$status"
+    log_test_output "$output"
+    [[ "$status" -eq 1 ]]
+    [[ "$output" == *"Failed to write metrics for round 1"* ]]
+    [[ "$output" == *"Failed to backfill 1 round"* ]]
+}
+
+@test "backfill_workflow: fails when convergence update fails" {
+    setup_backfill_fixture "backfill-convergence-failure-test"
+    # shellcheck disable=SC2317  # Test stub is invoked indirectly by backfill_workflow.
+    update_convergence_metrics() { return 1; }
+
+    run backfill_workflow "backfill-convergence-failure-test" false false
+
+    log_test_actual "exit code" "$status"
+    log_test_output "$output"
+    [[ "$status" -eq 1 ]]
+    [[ "$output" == *"Failed to calculate convergence metrics"* ]]
 }
 
 # =============================================================================

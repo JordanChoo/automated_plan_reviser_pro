@@ -390,6 +390,10 @@ check_for_updates() {
     if [[ -f "$check_file" ]]; then
         local last_check now
         last_check=$(cat "$check_file" 2>/dev/null || echo "0")
+        if [[ ! "$last_check" =~ ^[0-9]+$ ]]; then
+            verbose "check_for_updates: ignoring invalid timestamp cache: $last_check"
+            last_check=0
+        fi
         now=$(date +%s)
         if (( now - last_check < one_day )); then
             return 0  # Skip - already checked today
@@ -718,6 +722,11 @@ find_oracle_assistant_response() {
         resolved_path=$(readlink -f "$oracle_path" 2>/dev/null || realpath "$oracle_path" 2>/dev/null || echo "$oracle_path")
     fi
 
+    if [[ "$resolved_path" != */node_modules/@steipete/oracle/* ]]; then
+        verbose "find_oracle_assistant_response: selected oracle binary is not the @steipete/oracle npm package: $oracle_path"
+        return 2
+    fi
+
     # Candidate 1: npm-style prefix from the executable selected by PATH.
     local bin_dir prefix_dir
     bin_dir=$(dirname "$oracle_path")
@@ -768,8 +777,14 @@ patch_oracle_stability_thresholds() {
         return 0
     fi
 
-    # Find the file to patch
-    if ! find_oracle_assistant_response; then
+    # Find the file to patch. Local wrappers/mocks named "oracle" are valid for
+    # tests and custom deployments, but they are not patchable npm installs.
+    local find_status=0
+    find_oracle_assistant_response || find_status=$?
+    if (( find_status == 2 )); then
+        verbose "patch_oracle_stability_thresholds: Skipping patch for non-npm Oracle command"
+        return 0
+    elif (( find_status != 0 )); then
         print_warning "Cannot find Oracle assistantResponse.js for stability patching"
         print_warning "GPT Pro Extended Thinking responses may be truncated"
         return 1
@@ -5444,6 +5459,7 @@ backfill_workflow() {
     mapfile -t sorted_entries < <(printf '%s\n' "${round_entries[@]}" | sort -n -t '|' -k1,1)
 
     local count=0
+    local failures=0
     local prev_output=""
 
     for entry in "${sorted_entries[@]}"; do
@@ -5477,7 +5493,7 @@ backfill_workflow() {
         fi
 
         local round_record
-        round_record=$(jq -nc \
+        if ! round_record=$(jq -nc \
             --argjson round "$round_num" \
             --arg timestamp "$timestamp" \
             --argjson output "$output_metrics" \
@@ -5489,10 +5505,18 @@ backfill_workflow() {
                 output: $output,
                 changes_from_previous: $changes,
                 backfilled: true
-            }')
+            }'); then
+            print_warning "Failed to build metrics record for round $round_num"
+            ((failures++)) || true
+            prev_output="$round_file"
+            continue
+        fi
 
         if ! metrics_write_round "$workflow" "$round_num" "$round_record"; then
             print_warning "Failed to write metrics for round $round_num"
+            ((failures++)) || true
+            prev_output="$round_file"
+            continue
         fi
 
         prev_output="$round_file"
@@ -5504,8 +5528,17 @@ backfill_workflow() {
         return 0
     fi
 
+    if (( failures > 0 )); then
+        print_error "Failed to backfill $failures round(s)"
+        [[ "$count" -gt 0 ]] && print_info "Successfully backfilled $count round(s)"
+        return 1
+    fi
+
     verbose "Calculating convergence metrics..."
-    update_convergence_metrics "$workflow"
+    if ! update_convergence_metrics "$workflow"; then
+        print_error "Failed to calculate convergence metrics"
+        return 1
+    fi
 
     print_success "Backfilled $count rounds"
     print_success "Calculated convergence metrics"
@@ -5522,14 +5555,24 @@ backfill_all_workflows() {
     fi
 
     local count=0
+    local failures=0
     local config
     for config in "$workflow_dir"/*.yaml; do
         [[ -f "$config" ]] || continue
         local name
         name=$(basename "$config" .yaml)
-        backfill_workflow "$name" "$force" "$dry_run" || true
-        ((count++)) || true
+        if backfill_workflow "$name" "$force" "$dry_run"; then
+            ((count++)) || true
+        else
+            ((failures++)) || true
+        fi
     done
+
+    if (( failures > 0 )); then
+        print_error "Failed to process $failures workflow(s)"
+        [[ "$count" -gt 0 ]] && print_info "Successfully processed $count workflow(s)"
+        return 1
+    fi
 
     print_success "Processed $count workflow(s)"
 }

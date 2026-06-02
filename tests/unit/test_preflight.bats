@@ -1,4 +1,5 @@
 #!/usr/bin/env bats
+# shellcheck disable=SC2030,SC2031,SC2119,SC2120  # BATS runs each test in an isolated shell; create_docs has an optional arg.
 # test_preflight.bats - Unit tests for preflight_check and validation paths
 
 # Load test helpers
@@ -12,7 +13,7 @@ setup() {
     setup_test_environment
     load_apr_functions
     log_test_start "${BATS_TEST_NAME}"
-    cd "$TEST_PROJECT"
+    cd "$TEST_PROJECT" || return 1
 }
 
 teardown() {
@@ -294,7 +295,40 @@ EOF
     PATH="$original_path"
     export PATH
 
-    [[ "$status" -eq 1 ]]
+    [[ "$status" -eq 2 ]]
+}
+
+@test "patch_oracle_stability_thresholds: skips local oracle wrappers without warning" {
+    local mock_bin="$TEST_DIR/mock_bin"
+    mkdir -p "$mock_bin"
+
+    cat > "$mock_bin/oracle" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "--version" ]]; then
+    echo "oracle wrapper"
+    exit 0
+fi
+exit 0
+EOF
+    chmod +x "$mock_bin/oracle"
+
+    local original_path="$PATH"
+    PATH="$mock_bin:$PATH"
+    # shellcheck disable=SC2034  # Consumed by patch_oracle_stability_thresholds.
+    ORACLE_CMD=("oracle")
+    # shellcheck disable=SC2034  # Consumed by patch_oracle_stability_thresholds.
+    APR_ORACLE_PATCHED=false
+    unset APR_NO_ORACLE_PATCH 2>/dev/null || true
+    export PATH
+
+    capture_streams patch_oracle_stability_thresholds
+
+    PATH="$original_path"
+    export PATH
+
+    [[ "$CAPTURED_STATUS" -eq 0 ]]
+    [[ "$CAPTURED_STDERR" != *"Cannot find Oracle assistantResponse.js"* ]]
+    [[ "$CAPTURED_STDERR" != *"responses may be truncated"* ]]
 }
 
 @test "find_oracle_assistant_response: finds package adjacent to selected oracle symlink" {

@@ -14,7 +14,7 @@ setup() {
     setup_test_environment
     log_test_start "${BATS_TEST_NAME}"
 
-    cd "$TEST_PROJECT"
+    cd "$TEST_PROJECT" || return 1
     setup_test_workflow "default"
 }
 
@@ -375,6 +375,7 @@ teardown() {
 @test "apr backfill: --all processes all workflows" {
     setup_test_workflow "workflow-a"
     setup_test_workflow "workflow-b"
+    create_mock_round 1 "default"
     create_mock_round 1 "workflow-a"
     create_mock_round 1 "workflow-b"
 
@@ -383,7 +384,30 @@ teardown() {
     log_test_output "$output"
 
     assert_success
-    [[ -f ".apr/analytics/workflow-a/metrics.json" ]] || [[ "$output" == *"workflow"* ]]
+    [[ -f ".apr/analytics/default/metrics.json" ]]
+    [[ -f ".apr/analytics/workflow-a/metrics.json" ]]
+    [[ -f ".apr/analytics/workflow-b/metrics.json" ]]
+}
+
+@test "apr backfill: --all fails when any workflow fails" {
+    setup_test_workflow "workflow-a"
+    setup_test_workflow "workflow-b"
+    create_mock_round 1 "default"
+    create_mock_round 1 "workflow-a"
+    create_mock_round 1 "workflow-b"
+
+    run "$APR_SCRIPT" backfill -w workflow-b
+    assert_success
+
+    run "$APR_SCRIPT" backfill --all
+
+    log_test_output "$output"
+
+    assert_failure
+    [[ -f ".apr/analytics/default/metrics.json" ]]
+    [[ -f ".apr/analytics/workflow-a/metrics.json" ]]
+    [[ "$output" == *"Metrics already exist for 'workflow-b'"* ]]
+    [[ "$output" == *"Failed to process 1 workflow"* ]]
 }
 
 @test "apr backfill: skips existing metrics without --force" {

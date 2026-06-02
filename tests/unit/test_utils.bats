@@ -1,4 +1,5 @@
 #!/usr/bin/env bats
+# shellcheck disable=SC2030,SC2031  # BATS runs each test in an isolated shell.
 # test_utils.bats - Unit tests for APR utility functions
 #
 # Tests:
@@ -212,6 +213,34 @@ teardown() {
 # =============================================================================
 # Environment Variable Detection Tests
 # =============================================================================
+
+@test "check_for_updates: ignores invalid cached timestamp" {
+    local original_path="$PATH"
+    local bin_dir="$TEST_DIR/no_downloaders"
+    mkdir -p "$bin_dir"
+
+    local tool
+    for tool in cat date mkdir; do
+        ln -s "$(command -v "$tool")" "$bin_dir/$tool"
+    done
+
+    APR_HOME="$TEST_DIR/apr_home"
+    APR_CHECK_UPDATES=1
+    mkdir -p "$APR_HOME"
+    printf '%s\n' "not-a-timestamp" > "$APR_HOME/.last_update_check"
+    PATH="$bin_dir"
+    export APR_HOME APR_CHECK_UPDATES PATH
+
+    run check_for_updates
+
+    PATH="$original_path"
+    export PATH
+
+    log_test_actual "exit code" "$status"
+    log_test_actual "timestamp cache" "$(cat "$APR_HOME/.last_update_check")"
+    assert_success
+    [[ "$(cat "$APR_HOME/.last_update_check")" =~ ^[0-9]+$ ]]
+}
 
 @test "check_gum: returns failure when APR_NO_GUM is set" {
     export APR_NO_GUM=1
