@@ -23,7 +23,7 @@ setup() {
     load_apr_functions
 
     # Set up a project context
-    cd "$TEST_PROJECT"
+    cd "$TEST_PROJECT" || return 1
 
     # Initialize CONFIG_DIR to test project's .apr
     CONFIG_DIR="$TEST_PROJECT/.apr"
@@ -33,6 +33,18 @@ setup() {
 teardown() {
     log_test_end "${BATS_TEST_NAME}" "$([[ ${status:-0} -eq 0 ]] && echo pass || echo fail)"
     teardown_test_environment
+}
+
+create_path_without_flock() {
+    local bin_dir="$TEST_DIR/no_flock_bin"
+    mkdir -p "$bin_dir"
+
+    local tool
+    for tool in mkdir cat rm sleep; do
+        ln -s "$(command -v "$tool")" "$bin_dir/$tool"
+    done
+
+    printf '%s\n' "$bin_dir"
 }
 
 # =============================================================================
@@ -274,6 +286,49 @@ teardown() {
 
     [[ "$confidence" == "0.75" ]]
     [[ "$detected" == "true" ]]
+}
+
+@test "metrics_lock: fallback lock writes numeric owner pid" {
+    local original_path="$PATH"
+    local no_flock_path lock_file lock_pid
+    no_flock_path="$(create_path_without_flock)"
+
+    PATH="$no_flock_path"
+    export PATH
+
+    metrics_lock "fallback-pid-test"
+    lock_file="$(metrics_dir "fallback-pid-test")/.metrics.lock"
+    lock_pid=$(cat "$lock_file")
+    metrics_unlock "fallback-pid-test"
+
+    PATH="$original_path"
+    export PATH
+
+    log_test_actual "fallback lock pid" "$lock_pid"
+    [[ "$lock_pid" =~ ^[0-9]+$ ]]
+    [[ "$lock_pid" != '$' ]]
+}
+
+@test "metrics_write_round: propagates metrics_write_file failure" {
+    metrics_init "write-round-failure-test"
+    # shellcheck disable=SC2317  # Test stub is invoked indirectly by metrics_write_round.
+    metrics_write_file() { return 1; }
+
+    run metrics_write_round "write-round-failure-test" 1 '{"round":1}'
+
+    log_test_actual "exit code" "$status"
+    [[ "$status" -eq 1 ]]
+}
+
+@test "metrics_write_convergence: propagates metrics_write_file failure" {
+    metrics_init "write-convergence-failure-test"
+    # shellcheck disable=SC2317  # Test stub is invoked indirectly by metrics_write_convergence.
+    metrics_write_file() { return 1; }
+
+    run metrics_write_convergence "write-convergence-failure-test" '{"confidence":0.5}'
+
+    log_test_actual "exit code" "$status"
+    [[ "$status" -eq 1 ]]
 }
 
 # =============================================================================

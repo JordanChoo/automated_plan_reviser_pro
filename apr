@@ -2272,7 +2272,10 @@ metrics_write_round() {
         return 1
     fi
 
-    metrics_write_file "$workflow" "$merged"
+    if ! metrics_write_file "$workflow" "$merged"; then
+        metrics_unlock "$workflow"
+        return 1
+    fi
     metrics_unlock "$workflow"
     verbose "metrics_write_round: wrote round $round_num for workflow '$workflow'"
 }
@@ -2313,7 +2316,10 @@ metrics_write_convergence() {
         return 1
     fi
 
-    metrics_write_file "$workflow" "$merged"
+    if ! metrics_write_file "$workflow" "$merged"; then
+        metrics_unlock "$workflow"
+        return 1
+    fi
     metrics_unlock "$workflow"
     verbose "metrics_write_convergence: updated convergence for workflow '$workflow'"
 }
@@ -2427,9 +2433,14 @@ metrics_lock() {
 
     if command -v flock &>/dev/null; then
 
-        exec {METRICS_LOCK_FD}>"$lock_file"
+        if ! exec {METRICS_LOCK_FD}>"$lock_file"; then
+            METRICS_LOCK_FD=""
+            return 1
+        fi
 
         if ! flock -x "$METRICS_LOCK_FD"; then
+            { exec {METRICS_LOCK_FD}>&-; } 2>/dev/null || true
+            METRICS_LOCK_FD=""
 
             return 1
 
@@ -2441,7 +2452,7 @@ metrics_lock() {
 
         local retries=0
 
-        while ! (set -C; echo "$" > "$lock_file") 2>/dev/null; do
+        while ! (set -C; echo "$$" > "$lock_file") 2>/dev/null; do
 
             # Check for stale lock
 
@@ -2493,7 +2504,7 @@ metrics_unlock() {
 
     if [[ -n "$METRICS_LOCK_FD" ]]; then
 
-        exec {METRICS_LOCK_FD}>&-
+        { exec {METRICS_LOCK_FD}>&-; } 2>/dev/null || true
 
         METRICS_LOCK_FD=""
 
@@ -5402,9 +5413,13 @@ backfill_workflow() {
         print_info "[DRY RUN] Would backfill workflow '$workflow'"
     else
         if metrics_exists "$workflow" && [[ "$force" == "true" ]]; then
-            metrics_write_file "$workflow" "$(metrics_default_json "$workflow")"
+            if ! metrics_write_file "$workflow" "$(metrics_default_json "$workflow")"; then
+                return 1
+            fi
         else
-            metrics_init "$workflow"
+            if ! metrics_init "$workflow"; then
+                return 1
+            fi
         fi
     fi
 

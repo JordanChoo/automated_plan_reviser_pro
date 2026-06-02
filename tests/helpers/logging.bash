@@ -45,7 +45,7 @@ init_test_logging() {
 # get_log_file - Get current log file path, initializing if needed
 get_log_file() {
     if [[ -z "$TEST_LOG_FILE" || ! -f "$TEST_LOG_FILE" ]]; then
-        init_test_logging
+        init_test_logging "${TEST_LOG_DIR:-${TMPDIR:-/tmp}/apr_test_logs}"
     fi
     echo "$TEST_LOG_FILE"
 }
@@ -158,7 +158,9 @@ log_test_output() {
     local output="$1"
 
     log_raw "  OUTPUT:"
-    echo "$output" | sed 's/^/    /' >> "$(get_log_file)"
+    while IFS= read -r line; do
+        printf '    %s\n' "$line"
+    done <<< "$output" >> "$(get_log_file)"
 }
 
 # log_test_error - Log an error
@@ -190,7 +192,11 @@ log_command() {
     log_raw "  EXIT: $exit_status"
     if [[ -n "$output" ]]; then
         log_raw "  OUTPUT:"
-        echo "$output" | head -50 | sed 's/^/    /' >> "$(get_log_file)"
+        local output_head
+        output_head=$(printf '%s\n' "$output" | head -50)
+        while IFS= read -r line; do
+            printf '    %s\n' "$line"
+        done <<< "$output_head" >> "$(get_log_file)"
         local line_count
         line_count=$(echo "$output" | wc -l)
         if (( line_count > 50 )); then
