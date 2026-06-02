@@ -1572,6 +1572,256 @@ load_prompt_template() {
     printf '%s' "$template"
 }
 
+# -----------------------------------------------------------------------------
+# Prompt Manifest Helpers
+# -----------------------------------------------------------------------------
+#
+# The manifest is a deterministic, compact summary of the documents that APR is
+# about to bind to a prompt. These helpers intentionally do not prepend anything
+# to prompts yet; bd-3i5 owns integration into run/render paths.
+
+manifest_file_sha256() {
+    local file_path="$1"
+
+    [[ -f "$file_path" && -r "$file_path" ]] || return 1
+
+    if command -v sha256sum &>/dev/null; then
+        sha256sum -- "$file_path" | awk '{print $1}'
+    elif command -v shasum &>/dev/null; then
+        shasum -a 256 -- "$file_path" | awk '{print $1}'
+    else
+        return 1
+    fi
+}
+
+manifest_file_size_bytes() {
+    local file_path="$1"
+    local size_bytes=""
+
+    [[ -f "$file_path" && -r "$file_path" ]] || return 1
+
+    size_bytes=$(stat -c '%s' -- "$file_path" 2>/dev/null || stat -f '%z' "$file_path" 2>/dev/null || wc -c < "$file_path")
+    size_bytes=${size_bytes//[[:space:]]/}
+    [[ "$size_bytes" =~ ^[0-9]+$ ]] || return 1
+
+    printf '%s\n' "$size_bytes"
+}
+
+manifest_sanitize_field() {
+    local value="${1:-}"
+    value=${value//$'\t'/ }
+    value=${value//$'\n'/ }
+    printf '%s' "$value"
+}
+
+manifest_normalize_path() {
+    local file_path="${1:-}"
+    local project_root="${APR_PROJECT_ROOT:-$PWD}"
+
+    if [[ -z "$file_path" ]]; then
+        printf '%s\n' "(not configured)"
+        return 0
+    fi
+
+    while [[ "$file_path" == ./* ]]; do
+        file_path="${file_path#./}"
+    done
+
+    if [[ "$file_path" == /* ]]; then
+        case "$file_path" in
+            "$project_root"/*)
+                file_path="${file_path#"$project_root"/}"
+                ;;
+            *)
+                file_path="$(basename -- "$file_path")"
+                ;;
+        esac
+    fi
+
+    printf '%s\n' "$file_path"
+}
+
+manifest_basename() {
+    local file_path="${1:-}"
+    if [[ -z "$file_path" ]]; then
+        printf '%s\n' ""
+    else
+        basename -- "$file_path"
+    fi
+}
+
+manifest_role_sort_key() {
+    local role="$1"
+    case "$role" in
+        readme) echo "010" ;;
+        implementation) echo "020" ;;
+        spec) echo "030" ;;
+        *) printf '900-%s\n' "$role" ;;
+    esac
+}
+
+manifest_inclusion_reason() {
+    local role="$1"
+    local include_impl="${2:-false}"
+    local impl_reason="${3:-}"
+
+    case "$role" in
+        readme|spec)
+            echo "required"
+            ;;
+        implementation)
+            if [[ "$include_impl" != "true" ]]; then
+                echo "not_requested"
+            elif [[ "$impl_reason" == "impl_every_n" ]]; then
+                echo "impl_every_n"
+            else
+                echo "explicit_include_impl"
+            fi
+            ;;
+        *)
+            echo "optional"
+            ;;
+    esac
+}
+
+manifest_missing_reason() {
+    local role="$1"
+    case "$role" in
+        readme|spec) echo "missing_required" ;;
+        implementation) echo "missing_optional" ;;
+        *) echo "missing_optional" ;;
+    esac
+}
+
+manifest_unreadable_reason() {
+    local role="$1"
+    case "$role" in
+        readme|spec) echo "unreadable_required" ;;
+        implementation) echo "unreadable_optional" ;;
+        *) echo "unreadable_optional" ;;
+    esac
+}
+
+# Build one internal manifest entry as tab-separated fields:
+# sort_key, role, status, inclusion_reason, display_path, basename, bytes, sha256
+manifest_build_entry() {
+    local role="$1"
+    local file_path="${2:-}"
+    local inclusion_reason="${3:-}"
+    local status="${4:-}"
+    local sort_key display_path base_name size_bytes sha256_hash
+
+    sort_key=$(manifest_role_sort_key "$role")
+    display_path=$(manifest_sanitize_field "$(manifest_normalize_path "$file_path")")
+    base_name=$(manifest_sanitize_field "$(manifest_basename "$file_path")")
+
+    if [[ -z "$status" ]]; then
+        if [[ -z "$file_path" || ! -f "$file_path" ]]; then
+            status="skipped"
+            inclusion_reason=$(manifest_missing_reason "$role")
+        elif [[ ! -r "$file_path" ]]; then
+            status="skipped"
+            inclusion_reason=$(manifest_unreadable_reason "$role")
+        else
+            status="included"
+        fi
+    fi
+
+    if [[ "$status" == "included" ]]; then
+        size_bytes=$(manifest_file_size_bytes "$file_path") || return 1
+        sha256_hash=$(manifest_file_sha256 "$file_path") || return 1
+    else
+        size_bytes=""
+        sha256_hash=""
+    fi
+
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$sort_key" \
+        "$(manifest_sanitize_field "$role")" \
+        "$(manifest_sanitize_field "$status")" \
+        "$(manifest_sanitize_field "$inclusion_reason")" \
+        "$display_path" \
+        "$base_name" \
+        "$size_bytes" \
+        "$sha256_hash"
+}
+
+manifest_collect_documents() {
+    local readme_path="$1"
+    local spec_path="$2"
+    local impl_path="${3:-}"
+    local include_impl="${4:-false}"
+    local impl_reason="${5:-}"
+    local implementation_reason implementation_status
+
+    manifest_build_entry "readme" "$readme_path" "$(manifest_inclusion_reason "readme")"
+
+    implementation_reason=$(manifest_inclusion_reason "implementation" "$include_impl" "$impl_reason")
+    implementation_status=""
+    if [[ "$include_impl" != "true" ]]; then
+        implementation_status="skipped"
+    fi
+    manifest_build_entry "implementation" "$impl_path" "$implementation_reason" "$implementation_status"
+
+    manifest_build_entry "spec" "$spec_path" "$(manifest_inclusion_reason "spec")"
+}
+
+manifest_render_text() {
+    local manifest_entries="$1"
+    local tab=$'\t'
+
+    printf '%s\n' "APR DOCUMENT MANIFEST"
+    printf '%s\n' "$manifest_entries" | LC_ALL=C sort -t "$tab" -k1,1 | \
+        while IFS=$'\t' read -r sort_key role status inclusion_reason display_path base_name size_bytes sha256_hash; do
+            [[ -n "$sort_key$role$status$inclusion_reason$display_path$base_name$size_bytes$sha256_hash" ]] || continue
+            if [[ "$status" == "included" ]]; then
+                printf -- '- %s: %s [included; %s; %s; sha256=%s]\n' \
+                    "$role" "$display_path" "$inclusion_reason" "$(format_bytes "$size_bytes")" "$sha256_hash"
+            else
+                printf -- '- %s: %s [skipped; %s]\n' \
+                    "$role" "$display_path" "$inclusion_reason"
+            fi
+        done
+    printf '%s\n' "END APR DOCUMENT MANIFEST"
+}
+
+manifest_render_json() {
+    local manifest_entries="$1"
+    local tab=$'\t'
+
+    command -v jq &>/dev/null || return 1
+
+    printf '%s\n' "$manifest_entries" | LC_ALL=C sort -t "$tab" -k1,1 | \
+        while IFS=$'\t' read -r sort_key role status inclusion_reason display_path base_name size_bytes sha256_hash; do
+            [[ -n "$sort_key$role$status$inclusion_reason$display_path$base_name$size_bytes$sha256_hash" ]] || continue
+            local bytes_json="null"
+            local sha_json="null"
+            if [[ -n "$size_bytes" ]]; then
+                bytes_json="$size_bytes"
+            fi
+            if [[ -n "$sha256_hash" ]]; then
+                sha_json=$(jq -nc --arg sha "$sha256_hash" '$sha')
+            fi
+            jq -nc \
+                --arg role "$role" \
+                --arg status "$status" \
+                --arg inclusion_reason "$inclusion_reason" \
+                --arg path "$display_path" \
+                --arg basename "$base_name" \
+                --argjson bytes "$bytes_json" \
+                --argjson sha256 "$sha_json" \
+                '{
+                    role: $role,
+                    path: $path,
+                    basename: $basename,
+                    status: $status,
+                    inclusion_reason: $inclusion_reason,
+                    bytes: $bytes,
+                    sha256: $sha256
+                }'
+        done | jq -sc .
+}
+
 # Build the revision prompt for GPT Pro review
 # Usage: build_revision_prompt [include_impl]
 # Returns prompt via stdout
